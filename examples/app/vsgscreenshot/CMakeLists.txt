@@ -24,3 +24,15 @@ if (vsgXchange_FOUND)
 endif()
 
 install(TARGETS vsgscreenshot2 RUNTIME DESTINATION bin)
+
+
+add_executable(vsgscreenshot3 vsgscreenshot3.cpp)
+
+target_link_libraries(vsgscreenshot3 vsg::vsg)
+
+if (vsgXchange_FOUND)
+    target_compile_definitions(vsgscreenshot3 PRIVATE vsgXchange_FOUND)
+    target_link_libraries(vsgscreenshot3 vsgXchange::vsgXchange)
+endif()
+
+install(TARGETS vsgscreenshot3 RUNTIME DESTINATION bin)
