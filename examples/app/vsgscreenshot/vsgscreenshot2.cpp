@@ -17,6 +17,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 #ifdef vsgXchange_FOUND
 #    include <vsgXchange/all.h>
+#    include <vsgXchange/images.h>
 #endif
 
 #include <cassert>
@@ -97,6 +98,7 @@ vsg::ref_ptr<vsg::ImageView> createTransferImageView(
 }
 
 vsg::ref_ptr<vsg::Commands> createTransferCommands(
+    vsg::ref_ptr<vsg::Device> device,
     vsg::ref_ptr<vsg::Image> sourceImage,
     vsg::ref_ptr<vsg::Image> destinationImage)
 {
@@ -123,7 +125,10 @@ vsg::ref_ptr<vsg::Commands> createTransferCommands(
 
     commands->addChild(cmd_transitionForTransferBarrier);
 
-    if (sourceImage->format == destinationImage->format)
+    if (
+        sourceImage->format == destinationImage->format
+        && sourceImage->extent.width == destinationImage->extent.width
+        && sourceImage->extent.height == destinationImage->extent.height)
     {
         // use vkCmdCopyImage
         VkImageCopy region{};
@@ -142,7 +147,7 @@ vsg::ref_ptr<vsg::Commands> createTransferCommands(
 
         commands->addChild(copyImage);
     }
-    else
+    else if (supportsBlit(device, destinationImage->format))
     {
         // blit using vkCmdBlitImage
         VkImageBlit region{};
@@ -170,6 +175,14 @@ vsg::ref_ptr<vsg::Commands> createTransferCommands(
         blitImage->filter = VK_FILTER_NEAREST;
 
         commands->addChild(blitImage);
+    }
+    else
+    {
+        /// If the source and target extents and/or format are different
+        /// we would need to blit, however this device does not support it.
+        /// Options at this point include resizing on the CPU (using STBI
+        /// for example) or using a sampler.
+        throw std::runtime_error{"GPU does not support blit."};
     }
 
     // transition destination image from transfer destination layout
@@ -408,73 +421,6 @@ vsg::ref_ptr<vsg::Framebuffer> createOffscreenFramebuffer(
     return framebuffer;
 }
 
-vsg::ref_ptr<vsg::Data> getImageData(vsg::ref_ptr<vsg::Device> device, vsg::ref_ptr<vsg::Image> image)
-{
-    VkImageSubresource subResource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
-    VkSubresourceLayout subResourceLayout;
-    vkGetImageSubresourceLayout(*device, image->vk(device->deviceID), &subResource, &subResourceLayout);
-
-    auto deviceMemory = image->getDeviceMemory(device->deviceID);
-
-    VkExtent2D extent{image->extent.width, image->extent.height};
-
-    size_t destRowWidth = extent.width * sizeof(vsg::ubvec4);
-    vsg::ref_ptr<vsg::Data> imageData;
-    if (destRowWidth == subResourceLayout.rowPitch)
-    {
-        // Map the buffer memory and assign as a vec4Array2D that will automatically unmap itself on destruction.
-        imageData = vsg::MappedData<vsg::ubvec4Array2D>::create(
-            deviceMemory,
-            subResourceLayout.offset,
-            0,
-            vsg::Data::Properties{image->format},
-            extent.width,
-            extent.height);
-    }
-    else
-    {
-        // Map the buffer memory and assign as a ubyteArray that will automatically unmap itself on destruction.
-        // A ubyteArray is used as the graphics buffer memory is not contiguous like vsg::Array2D, so map to a flat buffer first then copy to Array2D.
-        auto mappedData = vsg::MappedData<vsg::ubyteArray>::create(
-            deviceMemory,
-            subResourceLayout.offset,
-            0,
-            vsg::Data::Properties{image->format},
-            subResourceLayout.rowPitch * extent.height);
-        imageData = vsg::ubvec4Array2D::create(extent.width, extent.height, vsg::Data::Properties{image->format});
-        for (uint32_t row = 0; row < extent.height; ++row)
-        {
-            std::memcpy(imageData->dataPointer(row * extent.width), mappedData->dataPointer(row * subResourceLayout.rowPitch), destRowWidth);
-        }
-    }
-    return imageData;
-}
-
-class ScreenshotHandler : public vsg::Inherit<vsg::Visitor, ScreenshotHandler>
-{
-public:
-    bool do_sync_extent = false;
-    bool do_image_capture = false;
-
-    ScreenshotHandler()
-    {
-        vsg::info("press 's' to save offscreen render to file");
-        vsg::info("press 'e' to set offscreen render extents to same as display");
-    }
-
-    void apply(vsg::KeyPressEvent& keyPress) override
-    {
-        if (keyPress.keyBase == 'e')
-        {
-            do_sync_extent = true;
-        }
-        if (keyPress.keyBase == 's')
-        {
-            do_image_capture = true;
-        }
-    }
-};
-
 std::tuple<vsg::ref_ptr<vsg::Camera>, vsg::ref_ptr<vsg::Perspective>> createCameraForScene(vsg::Node* scenegraph, const VkExtent2D& extent)
 {
     // compute the bounds of the scene graph to help position camera
@@ -502,14 +448,99 @@ std::tuple<vsg::ref_ptr<vsg::Camera>, vsg::ref_ptr<vsg::Perspective>> createCame
 
 void replaceChild(vsg::Group* group, vsg::ref_ptr<vsg::Node> previous, vsg::ref_ptr<vsg::Node> replacement)
 {
+    bool replaced = false;
     for (auto& child : group->children)
     {
         if (child == previous)
         {
             child = replacement;
+            replaced = true;
         }
     }
+    assert(replaced);
 }
+
+
+vsg::ref_ptr<vsg::Data> getImageData(vsg::ref_ptr<vsg::Viewer> viewer, vsg::ref_ptr<vsg::Device> device, vsg::ref_ptr<vsg::Image> captureImage)
+{
+    constexpr uint64_t waitTimeout = 1000000000; // 1 second
+    viewer->waitForFences(0, waitTimeout);
+
+    VkImageSubresource subResource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+    VkSubresourceLayout subResourceLayout;
+    vkGetImageSubresourceLayout(*device, captureImage->vk(device->deviceID), &subResource, &subResourceLayout);
+
+    auto deviceMemory = captureImage->getDeviceMemory(device->deviceID);
+
+    size_t destRowWidth = captureImage->extent.width * sizeof(vsg::ubvec4);
+    vsg::ref_ptr<vsg::Data> imageData;
+    if (destRowWidth == subResourceLayout.rowPitch)
+    {
+        /// Map the buffer memory and assign as a vec4Array2D that will automatically
+        /// unmap itself on destruction.
+        imageData = vsg::MappedData<vsg::ubvec4Array2D>::create(
+            deviceMemory,
+            subResourceLayout.offset,
+            0,
+            vsg::Data::Properties{captureImage->format},
+            captureImage->extent.width,
+            captureImage->extent.height);
+    }
+    else
+    {
+        /// Map the buffer memory and assign as a ubyteArray that will automatically
+        /// unmap itself on destruction. A ubyteArray is used as the graphics buffer
+        /// memory is not contiguous like vsg::Array2D, so map to a flat buffer first
+        /// then copy to Array2D.
+        auto mappedData = vsg::MappedData<vsg::ubyteArray>::create(
+            deviceMemory,
+            subResourceLayout.offset,
+            0,
+            vsg::Data::Properties{captureImage->format},
+            subResourceLayout.rowPitch * captureImage->extent.height);
+        imageData = vsg::ubvec4Array2D::create(captureImage->extent.width, captureImage->extent.height, vsg::Data::Properties{captureImage->format});
+        for (uint32_t row = 0; row < captureImage->extent.height; ++row)
+        {
+            std::memcpy(imageData->dataPointer(row * captureImage->extent.width), mappedData->dataPointer(row * subResourceLayout.rowPitch), destRowWidth);
+        }
+    }
+    return imageData;
+}
+
+void saveImage(vsg::Path const& filename, vsg::ref_ptr<vsg::Viewer> viewer, vsg::ref_ptr<vsg::Device> device, vsg::ref_ptr<vsg::Image> captureImage)
+{
+    vsg::info("writing image to file: ", filename);
+    auto imageData = getImageData(viewer, device, captureImage);
+    auto options = vsg::Options::create();
+    options->add(vsgXchange::stbi::create());
+    vsg::write(imageData, filename, options);
+    vsg::info("image saved.");
+}
+
+class ScreenshotHandler : public vsg::Inherit<vsg::Visitor, ScreenshotHandler>
+{
+public:
+    bool do_sync_extent = false;
+    bool do_image_capture = false;
+
+    ScreenshotHandler()
+    {
+        vsg::info("press 's' to save offscreen render to file");
+        vsg::info("press 'e' to set offscreen render extents to same as display");
+    }
+
+    void apply(vsg::KeyPressEvent& keyPress) override
+    {
+        if (keyPress.keyBase == 'e')
+        {
+            do_sync_extent = true;
+        }
+        if (keyPress.keyBase == 's')
+        {
+            do_image_capture = true;
+        }
+    }
+};
 
 int main(int argc, char** argv)
 {
@@ -521,7 +552,6 @@ int main(int argc, char** argv)
     windowTraits->debugLayer = arguments.read({"--debug", "-d"});
     windowTraits->apiDumpLayer = arguments.read({"--api", "-a"});
     windowTraits->synchronizationLayer = arguments.read("--sync");
-    arguments.read({"--extent"}, windowTraits->width, windowTraits->height);
 
     bool nestedCommandGraph = arguments.read({"-n", "--nested"});
     bool separateCommandGraph = arguments.read("-s");
@@ -611,12 +641,19 @@ int main(int argc, char** argv)
 
     auto context = vsg::Context::create(window->getOrCreateDevice());
 
+    // add close handler to respond to the close window button and pressing escape
+    viewer->addEventHandler(vsg::CloseHandler::create(viewer));
+    viewer->addEventHandler(vsg::Trackball::create(displayCamera));
+
+    auto offscreenCommandGraph = vsg::CommandGraph::create(window);
+    offscreenCommandGraph->submitOrder = -1; // render before the displayCommandGraph
+
     VkFormat offscreenImageFormat = VK_FORMAT_R8G8B8A8_UNORM;
     VkExtent2D extent{windowTraits->width, windowTraits->height};
 
     auto transferImageView = createTransferImageView(context->device, offscreenImageFormat, extent, VK_SAMPLE_COUNT_1_BIT);
     auto captureImage = createCaptureImage(context->device, offscreenImageFormat, extent);
-    auto captureCommands = createTransferCommands(transferImageView->image, captureImage);
+    auto captureCommands = createTransferCommands(context->device, transferImageView->image, captureImage);
 
     auto offscreenRenderGraph = vsg::RenderGraph::create();
     offscreenRenderGraph->framebuffer = createOffscreenFramebuffer(context->device, transferImageView, samples);
@@ -635,29 +672,22 @@ int main(int argc, char** argv)
     offscreenCamera->projectionMatrix = offscreenPerspective;
     offscreenCamera->viewportState = vsg::ViewportState::create(window->extent2D());
 
-    auto offscreenView = vsg::View::create(offscreenCamera, vsg_scene);
-    offscreenRenderGraph->addChild(offscreenView);
-
     auto offscreenSwitch = vsg::Switch::create();
     bool offscreenEnabled = false;
     offscreenSwitch->addChild(offscreenEnabled, offscreenRenderGraph);
 
-    // add close handler to respond to the close window button and pressing escape
-    viewer->addEventHandler(vsg::CloseHandler::create(viewer));
-    viewer->addEventHandler(vsg::Trackball::create(displayCamera));
+    offscreenCommandGraph->addChild(offscreenSwitch);
+    offscreenCommandGraph->addChild(captureCommands);
+
+    auto offscreenView = vsg::View::create(offscreenCamera, vsg_scene);
+    offscreenRenderGraph->addChild(offscreenView);
 
     auto screenshotHandler = ScreenshotHandler::create();
     viewer->addEventHandler(screenshotHandler);
 
-    vsg::ref_ptr<vsg::CommandGraph> offscreenCommandGraph;
     if (nestedCommandGraph)
     {
         std::cout << "Nested CommandGraph, with nested offscreenCommandGraph as a child on the displayCommandGraph. " << std::endl;
-        offscreenCommandGraph = vsg::CommandGraph::create(window);
-        offscreenCommandGraph->submitOrder = -1; // render before the displayRenderGraph
-        offscreenCommandGraph->addChild(offscreenSwitch);
-        offscreenCommandGraph->addChild(captureCommands);
-
         auto commandGraph = vsg::CommandGraph::create(window);
         commandGraph->addChild(displayRenderGraph);
         commandGraph->addChild(offscreenCommandGraph); // offscreenCommandGraph nested within main CommandGraph
@@ -667,11 +697,6 @@ int main(int argc, char** argv)
     else if (separateCommandGraph)
     {
         std::cout << "Seperate CommandGraph with offscreenCommandGraph first, then main CommandGraph second." << std::endl;
-        offscreenCommandGraph = vsg::CommandGraph::create(window);
-        offscreenCommandGraph->submitOrder = -1; // render before the displayCommandGraph
-        offscreenCommandGraph->addChild(offscreenSwitch);
-        offscreenCommandGraph->addChild(captureCommands);
-
         auto displayCommandGraph = vsg::CommandGraph::create(window);
         displayCommandGraph->addChild(displayRenderGraph);
 
@@ -729,7 +754,7 @@ int main(int argc, char** argv)
 
                 transferImageView = createTransferImageView(context->device, offscreenImageFormat, extent, VK_SAMPLE_COUNT_1_BIT);
                 captureImage = createCaptureImage(context->device, offscreenImageFormat, extent);
-                captureCommands = createTransferCommands(transferImageView->image, captureImage);
+                captureCommands = createTransferCommands(context->device, transferImageView->image, captureImage);
                 replaceChild(offscreenCommandGraph, prevCaptureCommands, captureCommands);
                 offscreenRenderGraph->framebuffer = createOffscreenFramebuffer(context->device, transferImageView, samples);
                 offscreenRenderGraph->resized();
@@ -749,14 +774,7 @@ int main(int argc, char** argv)
         if (screenshotHandler->do_image_capture && offscreenEnabled)
         {
             screenshotHandler->do_image_capture = false;
-            vsg::info("writing image to file: ", captureFilename);
-
-            constexpr uint64_t waitTimeout = 1000000000; // 1 second
-            viewer->waitForFences(0, waitTimeout);
-
-            auto imageData = getImageData(context->device, captureImage);
-            vsg::write(imageData, captureFilename, options);
-
+            saveImage(captureFilename, viewer, context->device, captureImage);
             offscreenEnabled = false;
             offscreenSwitch->setAllChildren(offscreenEnabled);
         }
