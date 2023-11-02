@@ -813,8 +813,6 @@ int main(int argc, char** argv)
         }
         else if (screenshotHandler->do_image_capture && !offscreenCommandGraph->enabled)
         {
-                    auto displayExtent = displayCamera->getRenderArea().extent;
-                    offscreenCommandGraph->setImageCapture(displayExtent, samples, VK_FORMAT_R8G8B8A8_UNORM);
             offscreenCommandGraph->setEnabled(true);
         }
 

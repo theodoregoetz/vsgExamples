@@ -639,7 +639,7 @@ int main(int argc, char** argv)
     auto [displayCamera, displayPerspective] = createCameraForScene(vsg_scene, window->extent2D());
     auto displayRenderGraph = vsg::createRenderGraphForView(window, displayCamera, vsg_scene);
 
-    auto context = vsg::Context::create(window->getOrCreateDevice());
+    auto device = window->getOrCreateDevice();
 
     // add close handler to respond to the close window button and pressing escape
     viewer->addEventHandler(vsg::CloseHandler::create(viewer));
@@ -651,12 +651,12 @@ int main(int argc, char** argv)
     VkFormat offscreenImageFormat = VK_FORMAT_R8G8B8A8_UNORM;
     VkExtent2D extent{windowTraits->width, windowTraits->height};
 
-    auto transferImageView = createTransferImageView(context->device, offscreenImageFormat, extent, VK_SAMPLE_COUNT_1_BIT);
-    auto captureImage = createCaptureImage(context->device, offscreenImageFormat, extent);
-    auto captureCommands = createTransferCommands(context->device, transferImageView->image, captureImage);
+    auto transferImageView = createTransferImageView(device, offscreenImageFormat, extent, VK_SAMPLE_COUNT_1_BIT);
+    auto captureImage = createCaptureImage(device, offscreenImageFormat, extent);
+    auto captureCommands = createTransferCommands(device, transferImageView->image, captureImage);
 
     auto offscreenRenderGraph = vsg::RenderGraph::create();
-    offscreenRenderGraph->framebuffer = createOffscreenFramebuffer(context->device, transferImageView, samples);
+    offscreenRenderGraph->framebuffer = createOffscreenFramebuffer(device, transferImageView, samples);
     offscreenRenderGraph->renderArea.extent = offscreenRenderGraph->framebuffer->extent2D();
     offscreenRenderGraph->setClearValues(
         VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}},
@@ -752,11 +752,11 @@ int main(int argc, char** argv)
                 offscreenPerspective->aspectRatio = static_cast<double>(extent.width) / static_cast<double>(extent.height);
                 offscreenCamera->viewportState->set(0, 0, extent.width, extent.height);
 
-                transferImageView = createTransferImageView(context->device, offscreenImageFormat, extent, VK_SAMPLE_COUNT_1_BIT);
-                captureImage = createCaptureImage(context->device, offscreenImageFormat, extent);
-                captureCommands = createTransferCommands(context->device, transferImageView->image, captureImage);
+                transferImageView = createTransferImageView(device, offscreenImageFormat, extent, VK_SAMPLE_COUNT_1_BIT);
+                captureImage = createCaptureImage(device, offscreenImageFormat, extent);
+                captureCommands = createTransferCommands(device, transferImageView->image, captureImage);
                 replaceChild(offscreenCommandGraph, prevCaptureCommands, captureCommands);
-                offscreenRenderGraph->framebuffer = createOffscreenFramebuffer(context->device, transferImageView, samples);
+                offscreenRenderGraph->framebuffer = createOffscreenFramebuffer(device, transferImageView, samples);
                 offscreenRenderGraph->resized();
                 vsg::info("offscreen render resized to: ", extent.width, "x", extent.height);
             }
@@ -774,7 +774,7 @@ int main(int argc, char** argv)
         if (screenshotHandler->do_image_capture && offscreenEnabled)
         {
             screenshotHandler->do_image_capture = false;
-            saveImage(captureFilename, viewer, context->device, captureImage);
+            saveImage(captureFilename, viewer, device, captureImage);
             offscreenEnabled = false;
             offscreenSwitch->setAllChildren(offscreenEnabled);
         }
