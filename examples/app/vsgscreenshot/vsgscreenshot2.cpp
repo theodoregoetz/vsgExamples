@@ -268,7 +268,7 @@ vsg::ref_ptr<vsg::RenderPass> createTransferRenderPass(
         return createTransferRenderPass(device, imageFormat, depthFormat, requiresDepthRead);
     }
 
-    // First attachment is supersampled or multisampled target.
+    // First attachment is multisampled target.
     vsg::AttachmentDescription colorAttachment = {};
     colorAttachment.format = imageFormat;
     colorAttachment.samples = samples;
@@ -290,7 +290,7 @@ vsg::ref_ptr<vsg::RenderPass> createTransferRenderPass(
     resolveAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     resolveAttachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; // <-- difference from vsg::createMultisampledRenderPass()
 
-    // supersampled or multisampled depth attachment. Resolved if requiresDepthRead is true.
+    // multisampled depth attachment. Resolved if requiresDepthRead is true.
     vsg::AttachmentDescription depthAttachment = {};
     depthAttachment.format = depthFormat;
     depthAttachment.samples = samples;
@@ -453,38 +453,29 @@ vsg::ref_ptr<vsg::Data> getImageData(vsg::ref_ptr<vsg::Device> device, vsg::ref_
 class ScreenshotHandler : public vsg::Inherit<vsg::Visitor, ScreenshotHandler>
 {
 public:
+    bool do_sync_extent = false;
     bool do_image_capture = false;
-    vsg::ref_ptr<vsg::Image> image;
-    vsg::Path filename;
-    vsg::ref_ptr<vsg::Options> options;
 
-    ScreenshotHandler(
-        vsg::ref_ptr<vsg::Image> in_image,
-        vsg::Path const& in_filename,
-        vsg::ref_ptr<vsg::Options> in_options = {}) :
-        image(in_image), filename(in_filename), options(in_options)
+    ScreenshotHandler()
     {
+        vsg::info("press 's' to save offscreen render to file");
+        vsg::info("press 'e' to set offscreen render extents to same as display");
     }
 
     void apply(vsg::KeyPressEvent& keyPress) override
     {
+        if (keyPress.keyBase == 'e')
+        {
+            do_sync_extent = true;
+        }
         if (keyPress.keyBase == 's')
         {
             do_image_capture = true;
         }
     }
-
-    void screenshot_image(vsg::ref_ptr<vsg::Device> device)
-    {
-        do_image_capture = false;
-
-        vsg::info("writing image to file: ", filename);
-        auto imageData = getImageData(device, image);
-        vsg::write(imageData, filename, options);
-    }
 };
 
-vsg::ref_ptr<vsg::Camera> createCameraForScene(vsg::Node* scenegraph, const VkExtent2D& extent)
+std::tuple<vsg::ref_ptr<vsg::Camera>, vsg::ref_ptr<vsg::Perspective>> createCameraForScene(vsg::Node* scenegraph, const VkExtent2D& extent)
 {
     // compute the bounds of the scene graph to help position camera
     vsg::ComputeBounds computeBounds;
@@ -505,7 +496,8 @@ vsg::ref_ptr<vsg::Camera> createCameraForScene(vsg::Node* scenegraph, const VkEx
     double farDistance = radius * 4.5;
     auto perspective = vsg::Perspective::create(fieldOfViewY, aspectRatio, nearDistance, farDistance);
 
-    return vsg::Camera::create(perspective, lookAt, vsg::ViewportState::create(extent));
+    auto camera = vsg::Camera::create(perspective, lookAt, vsg::ViewportState::create(extent));
+    return std::tie(camera, perspective);
 }
 
 void replaceChild(vsg::Group* group, vsg::ref_ptr<vsg::Node> previous, vsg::ref_ptr<vsg::Node> replacement)
@@ -534,10 +526,8 @@ int main(int argc, char** argv)
     bool nestedCommandGraph = arguments.read({"-n", "--nested"});
     bool separateCommandGraph = arguments.read("-s");
 
-    // offscreen capture super and multi sampling parameters
+    // offscreen capture filename and multi sampling parameters
     auto captureFilename = arguments.value<vsg::Path>("screenshot.vsgt", {"--capture-file", "-f"});
-    unsigned short supersample = 1;
-    arguments.read("--supersample", supersample);
     bool msaa = arguments.read("--msaa");
 
     if (arguments.errors()) return arguments.writeErrorMessages(std::cerr);
@@ -616,16 +606,15 @@ int main(int argc, char** argv)
 
     viewer->addWindow(window);
 
-    auto displayCamera = createCameraForScene(vsg_scene, window->extent2D());
+    auto [displayCamera, displayPerspective] = createCameraForScene(vsg_scene, window->extent2D());
     auto displayRenderGraph = vsg::createRenderGraphForView(window, displayCamera, vsg_scene);
 
     auto context = vsg::Context::create(window->getOrCreateDevice());
 
     VkFormat offscreenImageFormat = VK_FORMAT_R8G8B8A8_UNORM;
     VkExtent2D extent{windowTraits->width, windowTraits->height};
-    VkExtent2D offscreenRenderExtent{supersample * extent.width, supersample * extent.height};
 
-    auto transferImageView = createTransferImageView(context->device, offscreenImageFormat, offscreenRenderExtent, VK_SAMPLE_COUNT_1_BIT);
+    auto transferImageView = createTransferImageView(context->device, offscreenImageFormat, extent, VK_SAMPLE_COUNT_1_BIT);
     auto captureImage = createCaptureImage(context->device, offscreenImageFormat, extent);
     auto captureCommands = createTransferCommands(transferImageView->image, captureImage);
 
@@ -636,7 +625,17 @@ int main(int argc, char** argv)
         VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}},
         VkClearDepthStencilValue{0.0f, 0});
 
-    auto offscreenView = vsg::View::create(displayCamera, vsg_scene);
+    auto offscreenCamera = vsg::Camera::create();
+    offscreenCamera->viewMatrix = displayCamera->viewMatrix;
+    auto offscreenPerspective = vsg::Perspective::create(
+        displayPerspective->fieldOfViewY,
+        displayPerspective->aspectRatio,
+        displayPerspective->nearDistance,
+        displayPerspective->farDistance);
+    offscreenCamera->projectionMatrix = offscreenPerspective;
+    offscreenCamera->viewportState = vsg::ViewportState::create(window->extent2D());
+
+    auto offscreenView = vsg::View::create(offscreenCamera, vsg_scene);
     offscreenRenderGraph->addChild(offscreenView);
 
     auto offscreenSwitch = vsg::Switch::create();
@@ -647,7 +646,7 @@ int main(int argc, char** argv)
     viewer->addEventHandler(vsg::CloseHandler::create(viewer));
     viewer->addEventHandler(vsg::Trackball::create(displayCamera));
 
-    auto screenshotHandler = ScreenshotHandler::create(captureImage, captureFilename, options);
+    auto screenshotHandler = ScreenshotHandler::create();
     viewer->addEventHandler(screenshotHandler);
 
     vsg::ref_ptr<vsg::CommandGraph> offscreenCommandGraph;
@@ -710,27 +709,35 @@ int main(int argc, char** argv)
     {
         viewer->handleEvents();
 
-        if (screenshotHandler->do_image_capture && !offscreenEnabled)
+        // set offscreen perspective is same as display except for aspect ratio
+        offscreenPerspective->fieldOfViewY = displayPerspective->fieldOfViewY;
+        offscreenPerspective->nearDistance = displayPerspective->nearDistance;
+        offscreenPerspective->farDistance = displayPerspective->farDistance;
+
+        if (screenshotHandler->do_sync_extent)
         {
+            screenshotHandler->do_sync_extent = false;
             VkExtent2D displayExtent = displayCamera->getRenderArea().extent;
             if (extent.width != displayExtent.width || extent.height != displayExtent.height)
             {
-                vsg::info("display extent changed to ", displayExtent.width, "x", displayExtent.height);
                 auto prevCaptureCommands = captureCommands;
 
                 extent = displayExtent;
-                offscreenRenderExtent = VkExtent2D{supersample * extent.width, supersample * extent.height};
 
-                transferImageView = createTransferImageView(context->device, offscreenImageFormat, offscreenRenderExtent, VK_SAMPLE_COUNT_1_BIT);
+                offscreenPerspective->aspectRatio = static_cast<double>(extent.width) / static_cast<double>(extent.height);
+                offscreenCamera->viewportState->set(0, 0, extent.width, extent.height);
+
+                transferImageView = createTransferImageView(context->device, offscreenImageFormat, extent, VK_SAMPLE_COUNT_1_BIT);
                 captureImage = createCaptureImage(context->device, offscreenImageFormat, extent);
                 captureCommands = createTransferCommands(transferImageView->image, captureImage);
                 replaceChild(offscreenCommandGraph, prevCaptureCommands, captureCommands);
                 offscreenRenderGraph->framebuffer = createOffscreenFramebuffer(context->device, transferImageView, samples);
                 offscreenRenderGraph->resized();
-
-                screenshotHandler->image = captureImage;
+                vsg::info("offscreen render resized to: ", extent.width, "x", extent.height);
             }
-
+        }
+        else if (screenshotHandler->do_image_capture && !offscreenEnabled)
+        {
             offscreenEnabled = true;
             offscreenSwitch->setAllChildren(offscreenEnabled);
         }
@@ -741,9 +748,15 @@ int main(int argc, char** argv)
 
         if (screenshotHandler->do_image_capture && offscreenEnabled)
         {
+            screenshotHandler->do_image_capture = false;
+            vsg::info("writing image to file: ", captureFilename);
+
             constexpr uint64_t waitTimeout = 1000000000; // 1 second
             viewer->waitForFences(0, waitTimeout);
-            screenshotHandler->screenshot_image(context->device);
+
+            auto imageData = getImageData(context->device, captureImage);
+            vsg::write(imageData, captureFilename, options);
+
             offscreenEnabled = false;
             offscreenSwitch->setAllChildren(offscreenEnabled);
         }
