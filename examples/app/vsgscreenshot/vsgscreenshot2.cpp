@@ -712,7 +712,7 @@ int main(int argc, char** argv)
 
         viewer->assignRecordAndSubmitTaskAndPresentation({commandGraph});
 
-        // offscreenCommandGraph used to handle interactive resize
+        // offscreenCommandGraph is used to handle interactive resize
         offscreenCommandGraph = commandGraph;
     }
 

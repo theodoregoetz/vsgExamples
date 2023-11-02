@@ -772,12 +772,9 @@ int main(int argc, char** argv)
     else
     {
         std::cout << "Single CommandGraph containing by the offscreen and main RenderGraphs" << std::endl;
-        auto commandGraph = vsg::CommandGraph::create(window);
-        commandGraph->addChild(offscreenCommandGraph->renderSwitch);
-        commandGraph->addChild(offscreenCommandGraph->captureCommands);
-        commandGraph->addChild(displayRenderGraph);
+        offscreenCommandGraph->addChild(displayRenderGraph);
 
-        viewer->assignRecordAndSubmitTaskAndPresentation({commandGraph});
+        viewer->assignRecordAndSubmitTaskAndPresentation({offscreenCommandGraph});
     }
 
     viewer->compile();
