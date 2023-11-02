@@ -642,9 +642,6 @@ int main(int argc, char** argv)
     windowTraits->apiDumpLayer = arguments.read({"--api", "-a"});
     windowTraits->synchronizationLayer = arguments.read("--sync");
 
-    bool nestedCommandGraph = arguments.read({"-n", "--nested"});
-    bool separateCommandGraph = arguments.read("-s");
-
     // offscreen capture filename and multi sampling parameters
     auto captureFilename = arguments.value<vsg::Path>("screenshot.vsgt", {"--capture-file", "-f"});
     bool msaa = arguments.read("--msaa");
@@ -752,30 +749,11 @@ int main(int argc, char** argv)
     auto screenshotHandler = ScreenshotHandler::create();
     viewer->addEventHandler(screenshotHandler);
 
-    if (nestedCommandGraph)
-    {
-        std::cout << "Nested CommandGraph, with nested offscreenCommandGraph as a child on the displayCommandGraph. " << std::endl;
-        auto commandGraph = vsg::CommandGraph::create(window);
-        commandGraph->addChild(displayRenderGraph);
-        commandGraph->addChild(offscreenCommandGraph); // offscreenCommandGraph nested within main CommandGraph
+    std::cout << "Seperate CommandGraph with offscreenCommandGraph first, then main CommandGraph second." << std::endl;
+    auto displayCommandGraph = vsg::CommandGraph::create(window);
+    displayCommandGraph->addChild(displayRenderGraph);
 
-        viewer->assignRecordAndSubmitTaskAndPresentation({commandGraph});
-    }
-    else if (separateCommandGraph)
-    {
-        std::cout << "Seperate CommandGraph with offscreenCommandGraph first, then main CommandGraph second." << std::endl;
-        auto displayCommandGraph = vsg::CommandGraph::create(window);
-        displayCommandGraph->addChild(displayRenderGraph);
-
-        viewer->assignRecordAndSubmitTaskAndPresentation({offscreenCommandGraph, displayCommandGraph});
-    }
-    else
-    {
-        std::cout << "Single CommandGraph containing by the offscreen and main RenderGraphs" << std::endl;
-        offscreenCommandGraph->addChild(displayRenderGraph);
-
-        viewer->assignRecordAndSubmitTaskAndPresentation({offscreenCommandGraph});
-    }
+    viewer->assignRecordAndSubmitTaskAndPresentation({offscreenCommandGraph, displayCommandGraph});
 
     viewer->compile();
 
