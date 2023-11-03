@@ -772,9 +772,6 @@ void DisplayViewer::saveImage(vsg::Path const& filename)
     offscreenCommandGraph->saveImage(filename);
     offscreenCommandGraph->setEnabled(false);
     this->advanceToNextFrame();
-    this->update();
-    this->recordAndSubmit();
-    this->present();
 }
 
 std::tuple<vsg::ref_ptr<vsg::Device>, int> createOffscreenDevice()
