@@ -464,13 +464,14 @@ bool replaceChild(vsg::Group* group, vsg::ref_ptr<vsg::Node> previous, vsg::ref_
 class OffscreenCommandGraph : public vsg::Inherit<vsg::CommandGraph, OffscreenCommandGraph>
 {
   public:
-    explicit OffscreenCommandGraph(vsg::ref_ptr<vsg::Device> in_device, int in_queueFamily, vsg::ref_ptr<vsg::Viewer> in_viewer, VkExtent2D const& in_extent);
-    explicit OffscreenCommandGraph(vsg::ref_ptr<vsg::Window> in_window, vsg::ref_ptr<vsg::Viewer> in_viewer);
+    OffscreenCommandGraph(vsg::ref_ptr<vsg::Device> in_device, int in_queueFamily, vsg::ref_ptr<vsg::Viewer> in_viewer, VkExtent2D const& in_extent);
+    OffscreenCommandGraph(vsg::ref_ptr<vsg::Window> in_window, vsg::ref_ptr<vsg::Viewer> in_viewer);
 
-    void init(VkExtent2D const& extent);
     void setImageCapture(VkExtent2D const& in_extent, VkSampleCountFlagBits const in_samples, VkFormat const in_format);
-    void setView(vsg::ref_ptr<vsg::View> in_view);
+    void setView(vsg::ref_ptr<vsg::View> in_view); // TODO: allow for multiple views
     void setEnabled(bool in_enabled);
+
+    VkSampleCountFlagBits samples() const;
 
     vsg::ref_ptr<vsg::Data> getImageData();
     void saveImage(vsg::Path const& filename);
@@ -480,8 +481,11 @@ class OffscreenCommandGraph : public vsg::Inherit<vsg::CommandGraph, OffscreenCo
     vsg::ref_ptr<vsg::Switch> renderSwitch = vsg::Switch::create();
     vsg::ref_ptr<vsg::Image> captureImage;
     vsg::ref_ptr<vsg::Commands> captureCommands;
-    vsg::ref_ptr<vsg::View> view;
+    vsg::ref_ptr<vsg::View> view; // TODO: allow for multiple views
     bool enabled = false;
+
+private:
+    void init(VkExtent2D const& extent);
 };
 
 OffscreenCommandGraph::OffscreenCommandGraph(vsg::ref_ptr<vsg::Device> in_device, int in_queueFamily, vsg::ref_ptr<vsg::Viewer> in_viewer, VkExtent2D const& in_extent)
@@ -524,10 +528,6 @@ void OffscreenCommandGraph::setImageCapture(VkExtent2D const& extent, VkSampleCo
 {
     assert(captureImage);
     assert(renderGraph);
-    assert(renderGraph->framebuffer);
-    assert(renderGraph->framebuffer->getAttachments().size() > 0);
-    assert(renderGraph->framebuffer->getAttachments().at(0));
-    assert(renderGraph->framebuffer->getAttachments().at(0)->image);
     assert(view);
     assert(view->camera);
     assert(view->camera->viewportState);
@@ -535,9 +535,11 @@ void OffscreenCommandGraph::setImageCapture(VkExtent2D const& extent, VkSampleCo
     assert(captureCommands);
     if (extent.width != captureImage->extent.width
         || extent.height != captureImage->extent.height
-        || samples != renderGraph->framebuffer->getAttachments().at(0)->image->samples
+        || samples != this->samples()
         || format != captureImage->format)
     {
+        // TODO: better to scale according to viewport of display
+        // to handle multiple views in the same render command graph
         view->camera->viewportState->set(0, 0, extent.width, extent.height);
 
         auto transferImageView = createTransferImageView(device, format, extent, VK_SAMPLE_COUNT_1_BIT);
@@ -556,6 +558,7 @@ void OffscreenCommandGraph::setImageCapture(VkExtent2D const& extent, VkSampleCo
     assert(renderGraph->framebuffer);
 }
 
+// TODO: allow for multiple views
 void OffscreenCommandGraph::setView(vsg::ref_ptr<vsg::View> in_view)
 {
     assert(in_view);
@@ -576,6 +579,16 @@ void OffscreenCommandGraph::setEnabled(bool in_enabled)
     assert(renderSwitch);
     enabled = in_enabled;
     renderSwitch->setAllChildren(enabled);
+}
+
+VkSampleCountFlagBits OffscreenCommandGraph::samples() const
+{
+    assert(renderGraph);
+    assert(renderGraph->framebuffer);
+    assert(renderGraph->framebuffer->getAttachments().size() > 0);
+    assert(renderGraph->framebuffer->getAttachments().at(0));
+    assert(renderGraph->framebuffer->getAttachments().at(0)->image);
+    return renderGraph->framebuffer->getAttachments().at(0)->image->samples;
 }
 
 vsg::ref_ptr<vsg::Data> OffscreenCommandGraph::getImageData()
@@ -636,6 +649,219 @@ void OffscreenCommandGraph::saveImage(vsg::Path const& filename)
     options->add(vsgXchange::stbi::create());
     vsg::write(imageData, filename, options);
     vsg::info("image saved.");
+}
+
+class DisplayView : public vsg::Inherit<vsg::View, DisplayView>
+{
+    DisplayView(VkExtent2D const& extent);
+    void syncOffscreenExtent();
+    void syncOffscreenFieldOfView();
+
+    vsg::ref_ptr<vsg::Camera> offscreenCamera;
+};
+
+DisplayView::DisplayView(VkExtent2D const& extent)
+: Inherit{}
+{
+    auto projection = vsg::Perspective::create();
+    auto lookAt = vsg::LookAt::create();
+    auto viewportState = vsg::ViewportState::create(extent);
+    camera = vsg::Camera::create(projection, lookAt, viewportState);
+
+    offscreenCamera = vsg::Camera::create();
+    offscreenCamera->viewMatrix = camera->viewMatrix;
+    offscreenCamera->projectionMatrix = vsg::Perspective::create();
+    offscreenCamera->viewportState = vsg::ViewportState::create();
+    this->syncOffscreenExtent();
+    this->syncOffscreenFieldOfView();
+}
+
+void DisplayView::syncOffscreenExtent()
+{
+    assert(camera);
+    assert(offscreenCamera);
+    assert(offscreenCamera->projectionMatrix);
+    assert(offscreenCamera->viewportState);
+
+    auto extent = camera->getRenderArea().extent;
+    auto offscreenPerspective = dynamic_cast<vsg::Perspective*>(offscreenCamera->projectionMatrix.get());
+    offscreenPerspective->aspectRatio = static_cast<double>(extent.width) / static_cast<double>(extent.height);
+    offscreenCamera->viewportState->set(0, 0, extent.width, extent.height);
+}
+
+void DisplayView::syncOffscreenFieldOfView()
+{
+    assert(camera);
+    assert(camera->projectionMatrix);
+    assert(offscreenCamera);
+    assert(offscreenCamera->projectionMatrix);
+
+    auto perspective = dynamic_cast<vsg::Perspective*>(camera->projectionMatrix.get());
+    auto offscreenPerspective = dynamic_cast<vsg::Perspective*>(offscreenCamera->projectionMatrix.get());
+    offscreenPerspective->fieldOfViewY = perspective->fieldOfViewY;
+    offscreenPerspective->nearDistance = perspective->nearDistance;
+    offscreenPerspective->farDistance = perspective->farDistance;
+}
+
+#if 0
+class DisplayViewer : public vsg::Inherit<vsg::Viewer, DisplayViewer>
+{
+public:
+    DisplayViewer(vsg::ref_ptr<vsg::Window> window);
+    void syncImageCaptureToDisplay();
+    void setImageCapture(VkExtent2D const& extent, VkSampleCountFlagBits samples, VkFormat format);
+    void saveImage(vsg::Path const& filename);
+
+    vsg::ref_ptr<OffscreenCommandGraph> offscreenCommandGraph;
+};
+
+DisplayViewer::DisplayViewer(vsg::ref_ptr<vsg::Window> window)
+: Inherit{}
+{
+    Inherit::addWindow(window);
+
+    std::tie(displayCamera, displayPerspective) = createCameraForScene(vsg_scene, window->extent2D());
+    auto displayRenderGraph = vsg::createRenderGraphForView(window, displayCamera, vsg_scene);
+
+    auto displayCommandGraph = vsg::CommandGraph::create(window);
+    displayCommandGraph->addChild(displayRenderGraph);
+
+    // add close handler to respond to the close window button and pressing escape
+    this->addEventHandler(vsg::CloseHandler::create(this));
+    this->addEventHandler(vsg::Trackball::create(displayCamera));
+
+    offscreenCommandGraph = OffscreenCommandGraph::create(window, this);
+
+    offscreenCamera = vsg::Camera::create();
+    offscreenCamera->viewMatrix = displayCamera->viewMatrix;
+    offscreenPerspective = vsg::Perspective::create(
+        displayPerspective->fieldOfViewY,
+        displayPerspective->aspectRatio,
+        displayPerspective->nearDistance,
+        displayPerspective->farDistance);
+    offscreenCamera->projectionMatrix = offscreenPerspective;
+    offscreenCamera->viewportState = vsg::ViewportState::create(window->extent2D());
+
+    auto offscreenView = vsg::View::create(offscreenCamera, vsg_scene);
+    offscreenCommandGraph->setView(offscreenView);
+
+    this->assignRecordAndSubmitTaskAndPresentation({offscreenCommandGraph, displayCommandGraph});
+    this->compile();
+
+    // ensure the offscreen renderGraph is connected
+    offscreenCommandGraph->setEnabled(true);
+    this->advanceToNextFrame();
+    this->update();
+    this->recordAndSubmit();
+    offscreenCommandGraph->setEnabled(false);
+}
+
+void DisplayViewer::syncImageCaptureToDisplay()
+{
+    assert(displayCamera);
+    assert(offscreenPerspective);
+    assert(offscreenCamera);
+    assert(offscreenCamera->viewportState);
+    assert(offscreenCommandGraph);
+    assert(offscreenCommandGraph->captureImage);
+    auto extent = displayCamera->getRenderArea().extent;
+    offscreenPerspective->aspectRatio = static_cast<double>(extent.width) / static_cast<double>(extent.height);
+    offscreenCamera->viewportState->set(0, 0, extent.width, extent.height);
+    offscreenCommandGraph->setImageCapture(extent, offscreenCommandGraph->samples(), offscreenCommandGraph->captureImage->format);
+}
+
+void DisplayViewer::setImageCapture(VkExtent2D const& extent, VkSampleCountFlagBits samples, VkFormat format)
+{
+    assert(offscreenCommandGraph);
+    offscreenCommandGraph->setImageCapture(extent, samples, format);
+    assert(offscreenCommandGraph->captureImage);
+}
+
+void DisplayViewer::saveImage(vsg::Path const& filename)
+{
+    assert(offscreenPerspective);
+    assert(offscreenCommandGraph);
+    offscreenPerspective->fieldOfViewY = displayPerspective->fieldOfViewY;
+    offscreenPerspective->nearDistance = displayPerspective->nearDistance;
+    offscreenPerspective->farDistance = displayPerspective->farDistance;
+    offscreenCommandGraph->setEnabled(true);
+    this->update();
+    this->recordAndSubmit();
+    this->present();
+    offscreenCommandGraph->saveImage(filename);
+    offscreenCommandGraph->setEnabled(false);
+}
+#endif
+
+std::tuple<vsg::ref_ptr<vsg::Device>, int> createOffscreenDevice()
+{
+    auto vulkanVersion = VK_API_VERSION_1_2;
+    bool debugLayer = true;
+    vsg::Names instanceExtensions;
+    vsg::Names requestedLayers;
+    if (debugLayer)
+    {
+        instanceExtensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+        instanceExtensions.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
+        requestedLayers.push_back("VK_LAYER_KHRONOS_validation");
+    }
+
+    vsg::Names validatedNames = vsg::validateInstancelayerNames(requestedLayers);
+
+    auto instance = vsg::Instance::create(instanceExtensions, validatedNames, vulkanVersion);
+    auto [physicalDevice, queueFamily] = instance->getPhysicalDeviceAndQueueFamily(VK_QUEUE_GRAPHICS_BIT);
+    if (!physicalDevice || queueFamily < 0)
+    {
+        std::cout << "Could not create PhysicalDevice" << std::endl;
+        throw std::runtime_error("Could not create PhysicalDevice");
+    }
+
+    vsg::Names deviceExtensions;
+    vsg::QueueSettings queueSettings{vsg::QueueSetting{queueFamily, {1.0}}};
+
+    bool enableGeometryShader = true;
+    auto deviceFeatures = vsg::DeviceFeatures::create();
+    deviceFeatures->get().samplerAnisotropy = VK_TRUE;
+    deviceFeatures->get().geometryShader = enableGeometryShader;
+
+    auto device = vsg::Device::create(physicalDevice, queueSettings, validatedNames, deviceExtensions, deviceFeatures);
+
+    return std::tie(device, queueFamily);
+}
+
+class HeadlessViewer : public vsg::Inherit<vsg::Viewer, HeadlessViewer>
+{
+public:
+    HeadlessViewer(VkExtent2D const& extent);
+    void setView(vsg::ref_ptr<vsg::View> view); // TODO: allow for multiple views
+    void saveImage(vsg::Path const& filename);
+
+    vsg::ref_ptr<OffscreenCommandGraph> offscreenCommandGraph;
+};
+
+HeadlessViewer::HeadlessViewer(VkExtent2D const& extent)
+: Inherit{}
+{
+    auto [device, queueFamily] = createOffscreenDevice();
+    offscreenCommandGraph = OffscreenCommandGraph::create(device, queueFamily, vsg::ref_ptr(this), extent);
+    offscreenCommandGraph->setEnabled(true);
+    this->assignRecordAndSubmitTaskAndPresentation({offscreenCommandGraph});
+}
+
+// TODO: allow for multiple views
+void HeadlessViewer::setView(vsg::ref_ptr<vsg::View> view)
+{
+    offscreenCommandGraph->setView(view);
+}
+
+void HeadlessViewer::saveImage(vsg::Path const& filename)
+{
+    this->compile();
+    this->advanceToNextFrame();
+    this->update();
+    this->recordAndSubmit();
+    this->present();
+    offscreenCommandGraph->saveImage(filename);
 }
 
 class ScreenshotHandler : public vsg::Inherit<vsg::Visitor, ScreenshotHandler>
@@ -744,58 +970,18 @@ int main(int argc, char** argv)
     transform->addChild(vsg_scene);
     vsg_scene = transform;
 
-    // create the viewer and assign window(s) to it
-    auto viewer = vsg::Viewer::create();
-
-    vsg::ref_ptr<vsg::Camera> displayCamera;
-    vsg::ref_ptr<vsg::Perspective> displayPerspective;
-    vsg::ref_ptr<vsg::Camera> offscreenCamera;
-    vsg::ref_ptr<vsg::Perspective> offscreenPerspective;
-    vsg::ref_ptr<OffscreenCommandGraph> offscreenCommandGraph;
-    vsg::ref_ptr<ScreenshotHandler> screenshotHandler;
-
     if (headless)
     {
-        auto vulkanVersion = windowTraits->vulkanVersion;
-        bool debugLayer = true;
-        vsg::Names instanceExtensions;
-        vsg::Names requestedLayers;
-        if (debugLayer)
-        {
-            instanceExtensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
-            instanceExtensions.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
-            requestedLayers.push_back("VK_LAYER_KHRONOS_validation");
-        }
-
-        vsg::Names validatedNames = vsg::validateInstancelayerNames(requestedLayers);
-
-        auto instance = vsg::Instance::create(instanceExtensions, validatedNames, vulkanVersion);
-        auto [physicalDevice, queueFamily] = instance->getPhysicalDeviceAndQueueFamily(VK_QUEUE_GRAPHICS_BIT);
-        if (!physicalDevice || queueFamily < 0)
-        {
-            std::cout << "Could not create PhysicalDevice" << std::endl;
-            return 0;
-        }
-
-        vsg::Names deviceExtensions;
-        vsg::QueueSettings queueSettings{vsg::QueueSetting{queueFamily, {1.0}}};
-
-        bool enableGeometryShader = true;
-        auto deviceFeatures = vsg::DeviceFeatures::create();
-        deviceFeatures->get().samplerAnisotropy = VK_TRUE;
-        deviceFeatures->get().geometryShader = enableGeometryShader;
-
-        auto device = vsg::Device::create(physicalDevice, queueSettings, validatedNames, deviceExtensions, deviceFeatures);
-
         VkExtent2D extent{800, 600};
-        std::tie(offscreenCamera, offscreenPerspective) = createCameraForScene(vsg_scene, extent);
-        offscreenCommandGraph = OffscreenCommandGraph::create(device, queueFamily, viewer, extent);
 
-        auto offscreenView = vsg::View::create(offscreenCamera, vsg_scene);
-        offscreenCommandGraph->setView(offscreenView);
+        auto [camera, perspective] = createCameraForScene(vsg_scene, extent);
+        auto view = vsg::View::create(camera, vsg_scene);
 
-        viewer->assignRecordAndSubmitTaskAndPresentation({offscreenCommandGraph});
+        auto viewer = HeadlessViewer::create(extent);
+        viewer->setView(view);
+        viewer->saveImage(captureFilename);
     }
+
     else
     {
         auto window = vsg::Window::create(windowTraits);
@@ -805,9 +991,10 @@ int main(int argc, char** argv)
             return 1;
         }
 
+        auto viewer = vsg::Viewer::create();
         viewer->addWindow(window);
 
-        std::tie(displayCamera, displayPerspective) = createCameraForScene(vsg_scene, window->extent2D());
+        auto [displayCamera, displayPerspective] = createCameraForScene(vsg_scene, window->extent2D());
         auto displayRenderGraph = vsg::createRenderGraphForView(window, displayCamera, vsg_scene);
 
         auto displayCommandGraph = vsg::CommandGraph::create(window);
@@ -817,11 +1004,11 @@ int main(int argc, char** argv)
         viewer->addEventHandler(vsg::CloseHandler::create(viewer));
         viewer->addEventHandler(vsg::Trackball::create(displayCamera));
 
-        offscreenCommandGraph = OffscreenCommandGraph::create(window, viewer);
+        auto offscreenCommandGraph = OffscreenCommandGraph::create(window, viewer);
 
-        offscreenCamera = vsg::Camera::create();
+        auto offscreenCamera = vsg::Camera::create();
         offscreenCamera->viewMatrix = displayCamera->viewMatrix;
-        offscreenPerspective = vsg::Perspective::create(
+        auto offscreenPerspective = vsg::Perspective::create(
             displayPerspective->fieldOfViewY,
             displayPerspective->aspectRatio,
             displayPerspective->nearDistance,
@@ -832,34 +1019,19 @@ int main(int argc, char** argv)
         auto offscreenView = vsg::View::create(offscreenCamera, vsg_scene);
         offscreenCommandGraph->setView(offscreenView);
 
-        screenshotHandler = ScreenshotHandler::create();
+        viewer->assignRecordAndSubmitTaskAndPresentation({offscreenCommandGraph, displayCommandGraph});
+        viewer->compile();
+
+        // ensure the offscreen renderGraph is connected
+        offscreenCommandGraph->setEnabled(true);
+        viewer->advanceToNextFrame();
+        viewer->update();
+        viewer->recordAndSubmit();
+        offscreenCommandGraph->setEnabled(false);
+
+        auto screenshotHandler = ScreenshotHandler::create();
         viewer->addEventHandler(screenshotHandler);
 
-        viewer->assignRecordAndSubmitTaskAndPresentation({offscreenCommandGraph, displayCommandGraph});
-    }
-
-    viewer->compile();
-
-    // ensure the offscreen renderGraph is connected
-    offscreenCommandGraph->setEnabled(true);
-    if (viewer->advanceToNextFrame())
-    {
-        viewer->update();
-        viewer->recordAndSubmit();
-    }
-    offscreenCommandGraph->setEnabled(false);
-
-    if (headless)
-    {
-        offscreenCommandGraph->setEnabled(true);
-        assert(viewer->advanceToNextFrame());
-        viewer->update();
-        viewer->recordAndSubmit();
-        viewer->present();
-        offscreenCommandGraph->saveImage(captureFilename);
-    }
-    else
-    {
         // rendering main loop
         while (viewer->advanceToNextFrame())
         {
@@ -869,32 +1041,27 @@ int main(int argc, char** argv)
             {
                 screenshotHandler->do_sync_extent = false;
                 auto extent = displayCamera->getRenderArea().extent;
-
                 offscreenPerspective->aspectRatio = static_cast<double>(extent.width) / static_cast<double>(extent.height);
                 offscreenCamera->viewportState->set(0, 0, extent.width, extent.height);
-
-                offscreenCommandGraph->setImageCapture(extent, samples, VK_FORMAT_R8G8B8A8_UNORM);
+                offscreenCommandGraph->setImageCapture(extent, offscreenCommandGraph->samples(), offscreenCommandGraph->captureImage->format);
             }
-            else if (screenshotHandler->do_image_capture && !offscreenCommandGraph->enabled)
+            else if (screenshotHandler->do_image_capture)
             {
-                // ensure offscreen perspective is same as display except for aspect ratio
+                screenshotHandler->do_image_capture = false;
                 offscreenPerspective->fieldOfViewY = displayPerspective->fieldOfViewY;
                 offscreenPerspective->nearDistance = displayPerspective->nearDistance;
                 offscreenPerspective->farDistance = displayPerspective->farDistance;
-
                 offscreenCommandGraph->setEnabled(true);
+                viewer->update();
+                viewer->recordAndSubmit();
+                viewer->present();
+                offscreenCommandGraph->saveImage(captureFilename);
+                offscreenCommandGraph->setEnabled(false);
             }
 
             viewer->update();
             viewer->recordAndSubmit();
             viewer->present();
-
-            if (screenshotHandler->do_image_capture && offscreenCommandGraph->enabled)
-            {
-                screenshotHandler->do_image_capture = false;
-                offscreenCommandGraph->saveImage(captureFilename);
-                offscreenCommandGraph->setEnabled(false);
-            }
         }
     }
 
