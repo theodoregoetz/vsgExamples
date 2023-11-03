@@ -653,51 +653,51 @@ void OffscreenCommandGraph::saveImage(vsg::Path const& filename)
 
 class DisplayView : public vsg::Inherit<vsg::View, DisplayView>
 {
-    DisplayView(VkExtent2D const& extent);
-    void syncOffscreenExtent();
+public:
+    DisplayView(vsg::ref_ptr<vsg::Camera> in_camera, vsg::ref_ptr<vsg::Node> in_scenegraph = {});
+    VkExtent2D syncOffscreenExtent();
     void syncOffscreenFieldOfView();
 
-    vsg::ref_ptr<vsg::Camera> offscreenCamera;
+    vsg::ref_ptr<vsg::View> offscreenView;
 };
 
-DisplayView::DisplayView(VkExtent2D const& extent)
-: Inherit{}
+DisplayView::DisplayView(vsg::ref_ptr<vsg::Camera> in_camera, vsg::ref_ptr<vsg::Node> in_scenegraph)
+: Inherit{in_camera, in_scenegraph}
 {
-    auto projection = vsg::Perspective::create();
-    auto lookAt = vsg::LookAt::create();
-    auto viewportState = vsg::ViewportState::create(extent);
-    camera = vsg::Camera::create(projection, lookAt, viewportState);
-
-    offscreenCamera = vsg::Camera::create();
+    auto offscreenCamera = vsg::Camera::create();
     offscreenCamera->viewMatrix = camera->viewMatrix;
     offscreenCamera->projectionMatrix = vsg::Perspective::create();
     offscreenCamera->viewportState = vsg::ViewportState::create();
+    offscreenView = vsg::View::create(offscreenCamera, in_scenegraph);
     this->syncOffscreenExtent();
     this->syncOffscreenFieldOfView();
 }
 
-void DisplayView::syncOffscreenExtent()
+VkExtent2D DisplayView::syncOffscreenExtent()
 {
     assert(camera);
-    assert(offscreenCamera);
-    assert(offscreenCamera->projectionMatrix);
-    assert(offscreenCamera->viewportState);
+    assert(offscreenView);
+    assert(offscreenView->camera);
+    assert(offscreenView->camera->projectionMatrix);
+    assert(offscreenView->camera->viewportState);
 
     auto extent = camera->getRenderArea().extent;
-    auto offscreenPerspective = dynamic_cast<vsg::Perspective*>(offscreenCamera->projectionMatrix.get());
+    auto offscreenPerspective = dynamic_cast<vsg::Perspective*>(offscreenView->camera->projectionMatrix.get());
     offscreenPerspective->aspectRatio = static_cast<double>(extent.width) / static_cast<double>(extent.height);
-    offscreenCamera->viewportState->set(0, 0, extent.width, extent.height);
+    offscreenView->camera->viewportState->set(0, 0, extent.width, extent.height);
+    return extent;
 }
 
 void DisplayView::syncOffscreenFieldOfView()
 {
     assert(camera);
     assert(camera->projectionMatrix);
-    assert(offscreenCamera);
-    assert(offscreenCamera->projectionMatrix);
+    assert(offscreenView);
+    assert(offscreenView->camera);
+    assert(offscreenView->camera->projectionMatrix);
 
     auto perspective = dynamic_cast<vsg::Perspective*>(camera->projectionMatrix.get());
-    auto offscreenPerspective = dynamic_cast<vsg::Perspective*>(offscreenCamera->projectionMatrix.get());
+    auto offscreenPerspective = dynamic_cast<vsg::Perspective*>(offscreenView->camera->projectionMatrix.get());
     offscreenPerspective->fieldOfViewY = perspective->fieldOfViewY;
     offscreenPerspective->nearDistance = perspective->nearDistance;
     offscreenPerspective->farDistance = perspective->farDistance;
@@ -995,7 +995,9 @@ int main(int argc, char** argv)
         viewer->addWindow(window);
 
         auto [displayCamera, displayPerspective] = createCameraForScene(vsg_scene, window->extent2D());
-        auto displayRenderGraph = vsg::createRenderGraphForView(window, displayCamera, vsg_scene);
+        auto displayView = DisplayView::create(displayCamera, vsg_scene);
+
+        auto displayRenderGraph = vsg::RenderGraph::create(window, displayView);
 
         auto displayCommandGraph = vsg::CommandGraph::create(window);
         displayCommandGraph->addChild(displayRenderGraph);
@@ -1006,18 +1008,7 @@ int main(int argc, char** argv)
 
         auto offscreenCommandGraph = OffscreenCommandGraph::create(window, viewer);
 
-        auto offscreenCamera = vsg::Camera::create();
-        offscreenCamera->viewMatrix = displayCamera->viewMatrix;
-        auto offscreenPerspective = vsg::Perspective::create(
-            displayPerspective->fieldOfViewY,
-            displayPerspective->aspectRatio,
-            displayPerspective->nearDistance,
-            displayPerspective->farDistance);
-        offscreenCamera->projectionMatrix = offscreenPerspective;
-        offscreenCamera->viewportState = vsg::ViewportState::create(window->extent2D());
-
-        auto offscreenView = vsg::View::create(offscreenCamera, vsg_scene);
-        offscreenCommandGraph->setView(offscreenView);
+        offscreenCommandGraph->setView(displayView->offscreenView);
 
         viewer->assignRecordAndSubmitTaskAndPresentation({offscreenCommandGraph, displayCommandGraph});
         viewer->compile();
@@ -1040,23 +1031,21 @@ int main(int argc, char** argv)
             if (screenshotHandler->do_sync_extent)
             {
                 screenshotHandler->do_sync_extent = false;
-                auto extent = displayCamera->getRenderArea().extent;
-                offscreenPerspective->aspectRatio = static_cast<double>(extent.width) / static_cast<double>(extent.height);
-                offscreenCamera->viewportState->set(0, 0, extent.width, extent.height);
+                auto extent = displayView->syncOffscreenExtent();
                 offscreenCommandGraph->setImageCapture(extent, offscreenCommandGraph->samples(), offscreenCommandGraph->captureImage->format);
             }
             else if (screenshotHandler->do_image_capture)
             {
                 screenshotHandler->do_image_capture = false;
-                offscreenPerspective->fieldOfViewY = displayPerspective->fieldOfViewY;
-                offscreenPerspective->nearDistance = displayPerspective->nearDistance;
-                offscreenPerspective->farDistance = displayPerspective->farDistance;
+                displayView->syncOffscreenFieldOfView();
                 offscreenCommandGraph->setEnabled(true);
                 viewer->update();
                 viewer->recordAndSubmit();
                 viewer->present();
                 offscreenCommandGraph->saveImage(captureFilename);
                 offscreenCommandGraph->setEnabled(false);
+                viewer->advanceToNextFrame();
+                viewer->handleEvents();
             }
 
             viewer->update();
