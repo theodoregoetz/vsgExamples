@@ -664,7 +664,7 @@ int main(int argc, char** argv)
                     }
                 }
 
-                vsg::write(imageData, colorFilename);
+                vsg::write(imageData, colorFilename, options);
             }
 
             if (copiedDepthBuffer)
