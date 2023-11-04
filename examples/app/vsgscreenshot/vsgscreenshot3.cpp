@@ -421,7 +421,7 @@ vsg::ref_ptr<vsg::Framebuffer> createOffscreenFramebuffer(
     return framebuffer;
 }
 
-std::tuple<vsg::ref_ptr<vsg::Camera>, vsg::ref_ptr<vsg::Perspective>> createCameraForScene(vsg::Node* scenegraph, const VkExtent2D& extent)
+vsg::ref_ptr<vsg::Camera> createCameraForScene(vsg::Node* scenegraph, const VkExtent2D& extent)
 {
     // compute the bounds of the scene graph to help position camera
     vsg::ComputeBounds computeBounds;
@@ -443,7 +443,7 @@ std::tuple<vsg::ref_ptr<vsg::Camera>, vsg::ref_ptr<vsg::Perspective>> createCame
     auto perspective = vsg::Perspective::create(fieldOfViewY, aspectRatio, nearDistance, farDistance);
 
     auto camera = vsg::Camera::create(perspective, lookAt, vsg::ViewportState::create(extent));
-    return std::tie(camera, perspective);
+    return camera;
 }
 
 bool replaceChild(vsg::Group* group, vsg::ref_ptr<vsg::Node> previous, vsg::ref_ptr<vsg::Node> replacement)
@@ -764,6 +764,7 @@ void DisplayViewer::setImageCapture(VkExtent2D const& extent, VkSampleCountFlagB
 void DisplayViewer::saveImage(vsg::Path const& filename)
 {
     assert(displayView);
+    assert(offscreenCommandGraph);
     displayView->syncOffscreenFieldOfView();
     offscreenCommandGraph->setEnabled(true);
     this->update();
@@ -771,7 +772,6 @@ void DisplayViewer::saveImage(vsg::Path const& filename)
     this->present();
     offscreenCommandGraph->saveImage(filename);
     offscreenCommandGraph->setEnabled(false);
-    this->advanceToNextFrame();
 }
 
 std::tuple<vsg::ref_ptr<vsg::Device>, int> createOffscreenDevice()
@@ -838,7 +838,6 @@ void HeadlessViewer::setView(vsg::ref_ptr<vsg::View> view)
 
 void HeadlessViewer::saveImage(vsg::Path const& filename)
 {
-    this->advanceToNextFrame();
     this->update();
     this->recordAndSubmit();
     this->present();
@@ -853,19 +852,17 @@ public:
 
     ScreenshotHandler()
     {
-        vsg::info("press 's' to save offscreen render to file");
+        vsg::info("press 'f' to save offscreen render to file");
         vsg::info("press 'e' to set offscreen render extents to same as display");
     }
 
     void apply(vsg::KeyPressEvent& keyPress) override
     {
-        if (keyPress.keyBase == 'e')
+        switch (keyPress.keyBase)
         {
-            do_sync_extent = true;
-        }
-        if (keyPress.keyBase == 's')
-        {
-            do_image_capture = true;
+            case 'e': do_sync_extent = true; break;
+            case 'f': do_image_capture = true; break;
+            default: break;
         }
     }
 };
@@ -955,7 +952,7 @@ int main(int argc, char** argv)
     {
         VkExtent2D extent{800, 600};
 
-        auto [camera, perspective] = createCameraForScene(vsg_scene, extent);
+        auto camera = createCameraForScene(vsg_scene, extent);
         auto view = vsg::View::create(camera, vsg_scene);
 
         auto viewer = HeadlessViewer::create(extent);
@@ -974,7 +971,7 @@ int main(int argc, char** argv)
 
         auto viewer = DisplayViewer::create(window);
 
-        auto [displayCamera, displayPerspective] = createCameraForScene(vsg_scene, window->extent2D());
+        auto displayCamera = createCameraForScene(vsg_scene, window->extent2D());
         auto displayView = DisplayView::create(displayCamera, vsg_scene);
         viewer->setView(displayView);
 
@@ -999,6 +996,7 @@ int main(int argc, char** argv)
             {
                 screenshotHandler->do_image_capture = false;
                 viewer->saveImage(captureFilename);
+                continue;
             }
 
             viewer->update();
