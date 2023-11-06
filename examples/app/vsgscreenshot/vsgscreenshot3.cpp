@@ -94,7 +94,7 @@ vsg::ref_ptr<vsg::ImageView> createTransferImageView(
     image->arrayLayers = 1;
     image->samples = samples;
     image->usage = computeUsageFlagsForFormat(format) | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    image->initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
+    image->initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
 #if 0
 /*
@@ -108,24 +108,33 @@ vsg::ref_ptr<vsg::ImageView> createTransferImageView(
  * leaving the image to be used by the viewer's command graph later in the program.
  */
 
-    // transition image to transfer source optimal
-    auto transitionSourceImageToTransferSourceLayoutBarrier = vsg::ImageMemoryBarrier::create(
-        VK_ACCESS_MEMORY_READ_BIT,                                     // srcAccessMask
-        VK_ACCESS_TRANSFER_READ_BIT,                                   // dstAccessMask
-        VK_IMAGE_LAYOUT_PREINITIALIZED,                                // oldLayout
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,                          // newLayout
-        VK_QUEUE_FAMILY_IGNORED,                                       // srcQueueFamilyIndex
-        VK_QUEUE_FAMILY_IGNORED,                                       // dstQueueFamilyIndex
-        sourceImage,                                                   // image
-        VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1} // subresourceRange
-    );
-    auto transitionSourceImageToTransferSourceLayoutCommands = vsg::WaitEvents::create(
-        VK_PIPELINE_STAGE_TRANSFER_BIT,                      // srcStageMask
-        VK_PIPELINE_STAGE_TRANSFER_BIT,                      // dstStageMask
-        transitionSourceImageToTransferSourceLayoutBarrier
-    );
-    transitionSourceImageToTransferSourceLayoutCommands->record(commandBuffer);
+    {
+        auto queueFamily = device->getPhysicalDevice()->getQueueFamily(VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_TRANSFER_BIT);
+
+        // ensure image attachments are setup on GPU.
+        auto commandPool = vsg::CommandPool::create(device, graphicsFamily);
+        vsg::submitCommandsToQueue(commandPool, device->getQueue(queueFamily), [&](vsg::CommandBuffer& commandBuffer) {
+            auto imageBarrier = vsg::ImageMemoryBarrier::create(
+                VK_ACCESS_MEMORY_READ_BIT,                                     // srcAccessMask
+                VK_ACCESS_TRANSFER_READ_BIT,                                   // dstAccessMask
+                VK_IMAGE_LAYOUT_UNDEFINED,                                // oldLayout
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,                          // newLayout
+                VK_QUEUE_FAMILY_IGNORED,                                       // srcQueueFamilyIndex
+                VK_QUEUE_FAMILY_IGNORED,                                       // dstQueueFamilyIndex
+                image,                                                   // image
+                VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1} // subresourceRange
+            );
+            auto pipelineBarrier = vsg::PipelineBarrier::create(
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0,
+                imageBarrier
+            );
+            pipelineBarrier->record(commandBuffer);
+        });
+    }
 #endif
+
     return vsg::createImageView(device, image, vsg::computeAspectFlagsForFormat(format));
 }
 
@@ -234,7 +243,7 @@ vsg::ref_ptr<vsg::Commands> createTransferCommands(
         VK_PIPELINE_STAGE_TRANSFER_BIT,                // srcStageMask
         VK_PIPELINE_STAGE_TRANSFER_BIT,                // dstStageMask
         0,                                             // dependencyFlags
-        transitionDestinationImageToMemoryReadBarrier, // barrier
+        transitionDestinationImageToMemoryReadBarrier  // barrier
     );
 
     commands->addChild(cmd_transitionFromTransferBarrier);
