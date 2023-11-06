@@ -83,7 +83,6 @@ VkImageUsageFlags computeUsageFlagsForFormat(VkFormat format)
 
 vsg::ref_ptr<vsg::ImageView> createTransferImageView(
     vsg::ref_ptr<vsg::Device> device,
-    vsg::ref_ptr<vsg::CommandBuffer> commandBuffer,
     VkFormat format,
     const VkExtent2D& extent,
     VkSampleCountFlagBits samples)
@@ -419,7 +418,6 @@ vsg::ref_ptr<vsg::RenderPass> createTransferRenderPass(
 
 vsg::ref_ptr<vsg::Framebuffer> createOffscreenFramebuffer(
     vsg::ref_ptr<vsg::Device> device,
-    vsg::ref_ptr<vsg::CommandBuffer> commandBuffer,
     vsg::ref_ptr<vsg::ImageView> transferImageView,
     VkSampleCountFlagBits const samples)
 {
@@ -435,17 +433,17 @@ vsg::ref_ptr<vsg::Framebuffer> createOffscreenFramebuffer(
     if (samples == VK_SAMPLE_COUNT_1_BIT)
     {
         imageViews.emplace_back(transferImageView);
-        imageViews.emplace_back(createTransferImageView(device, commandBuffer, depthFormat, extent, VK_SAMPLE_COUNT_1_BIT));
+        imageViews.emplace_back(createTransferImageView(device, depthFormat, extent, VK_SAMPLE_COUNT_1_BIT));
     }
     else
     {
         // MSAA
-        imageViews.emplace_back(createTransferImageView(device, commandBuffer, imageFormat, extent, samples));
+        imageViews.emplace_back(createTransferImageView(device, imageFormat, extent, samples));
         imageViews.emplace_back(transferImageView);
-        imageViews.emplace_back(createTransferImageView(device, commandBuffer, depthFormat, extent, samples));
+        imageViews.emplace_back(createTransferImageView(device, depthFormat, extent, samples));
         if (requiresDepthRead)
         {
-            imageViews.emplace_back(createTransferImageView(device, commandBuffer, depthFormat, extent, VK_SAMPLE_COUNT_1_BIT));
+            imageViews.emplace_back(createTransferImageView(device, depthFormat, extent, VK_SAMPLE_COUNT_1_BIT));
         }
     }
 
@@ -544,8 +542,8 @@ void OffscreenCommandGraph::init(VkExtent2D const& extent)
     constexpr VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     constexpr VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 
-    auto transferImageView = createTransferImageView(device, commandBuffer, format, extent, samples);
-    renderGraph->framebuffer = createOffscreenFramebuffer(device, commandBuffer, transferImageView, samples);
+    auto transferImageView = createTransferImageView(device, format, extent, samples);
+    renderGraph->framebuffer = createOffscreenFramebuffer(device, transferImageView, samples);
     renderGraph->renderArea.extent = extent;
     renderGraph->setClearValues(
         VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}},
@@ -576,14 +574,14 @@ void OffscreenCommandGraph::setImageCapture(VkExtent2D const& extent, VkSampleCo
         // to handle multiple views in the same render command graph
         view->camera->viewportState->set(0, 0, extent.width, extent.height);
 
-        auto transferImageView = createTransferImageView(device, commandBuffer, format, extent, VK_SAMPLE_COUNT_1_BIT);
+        auto transferImageView = createTransferImageView(device, format, extent, VK_SAMPLE_COUNT_1_BIT);
         captureImage = createCaptureImage(device, format, extent);
 
         auto prevCaptureCommands = captureCommands;
         captureCommands = createTransferCommands(device, transferImageView->image, captureImage);
         replaceChild(this, prevCaptureCommands, captureCommands);
 
-        renderGraph->framebuffer = createOffscreenFramebuffer(device, commandBuffer, transferImageView, samples);
+        renderGraph->framebuffer = createOffscreenFramebuffer(device, transferImageView, samples);
         renderGraph->resized();
         vsg::info("offscreen render resized to: ", extent.width, "x", extent.height);
     }
