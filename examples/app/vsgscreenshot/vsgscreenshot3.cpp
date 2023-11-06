@@ -83,6 +83,7 @@ VkImageUsageFlags computeUsageFlagsForFormat(VkFormat format)
 
 vsg::ref_ptr<vsg::ImageView> createTransferImageView(
     vsg::ref_ptr<vsg::Device> device,
+    vsg::ref_ptr<vsg::CommandBuffer> commandBuffer,
     VkFormat format,
     const VkExtent2D& extent,
     VkSampleCountFlagBits samples)
@@ -94,6 +95,38 @@ vsg::ref_ptr<vsg::ImageView> createTransferImageView(
     image->arrayLayers = 1;
     image->samples = samples;
     image->usage = computeUsageFlagsForFormat(format) | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    image->initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED;
+
+#if 0
+/*
+ * Somehow, we need to convert the layout of this image to VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+ * If it's part of the commands in createTransferCommands(), we can convert it but the
+ * screen capture breaks and the validation layer complains that it's trying to convert
+ * from VK_IMAGE_LAYOUT_PREINITIALIZED to VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL over and over.
+ * Here, maybe the image layout can be converted once and ahead of time using a WaitEvent,
+ * but it's unclear how to execute this outside of the viewer's main loop - it's like we
+ * need a stand-alone commandgraph which is created, executes once and then is destroyed,
+ * leaving the image to be used by the viewer's command graph later in the program.
+ */
+
+    // transition image to transfer source optimal
+    auto transitionSourceImageToTransferSourceLayoutBarrier = vsg::ImageMemoryBarrier::create(
+        VK_ACCESS_MEMORY_READ_BIT,                                     // srcAccessMask
+        VK_ACCESS_TRANSFER_READ_BIT,                                   // dstAccessMask
+        VK_IMAGE_LAYOUT_PREINITIALIZED,                                // oldLayout
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,                          // newLayout
+        VK_QUEUE_FAMILY_IGNORED,                                       // srcQueueFamilyIndex
+        VK_QUEUE_FAMILY_IGNORED,                                       // dstQueueFamilyIndex
+        sourceImage,                                                   // image
+        VkImageSubresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1} // subresourceRange
+    );
+    auto transitionSourceImageToTransferSourceLayoutCommands = vsg::WaitEvents::create(
+        VK_PIPELINE_STAGE_TRANSFER_BIT,                      // srcStageMask
+        VK_PIPELINE_STAGE_TRANSFER_BIT,                      // dstStageMask
+        transitionSourceImageToTransferSourceLayoutBarrier
+    );
+    transitionSourceImageToTransferSourceLayoutCommands->record(commandBuffer);
+#endif
     return vsg::createImageView(device, image, vsg::computeAspectFlagsForFormat(format));
 }
 
@@ -199,10 +232,10 @@ vsg::ref_ptr<vsg::Commands> createTransferCommands(
     );
 
     auto cmd_transitionFromTransferBarrier = vsg::PipelineBarrier::create(
-        VK_PIPELINE_STAGE_TRANSFER_BIT,               // srcStageMask
-        VK_PIPELINE_STAGE_TRANSFER_BIT,               // dstStageMask
-        0,                                            // dependencyFlags
-        transitionDestinationImageToMemoryReadBarrier // barrier
+        VK_PIPELINE_STAGE_TRANSFER_BIT,                // srcStageMask
+        VK_PIPELINE_STAGE_TRANSFER_BIT,                // dstStageMask
+        0,                                             // dependencyFlags
+        transitionDestinationImageToMemoryReadBarrier, // barrier
     );
 
     commands->addChild(cmd_transitionFromTransferBarrier);
@@ -386,6 +419,7 @@ vsg::ref_ptr<vsg::RenderPass> createTransferRenderPass(
 
 vsg::ref_ptr<vsg::Framebuffer> createOffscreenFramebuffer(
     vsg::ref_ptr<vsg::Device> device,
+    vsg::ref_ptr<vsg::CommandBuffer> commandBuffer,
     vsg::ref_ptr<vsg::ImageView> transferImageView,
     VkSampleCountFlagBits const samples)
 {
@@ -401,17 +435,17 @@ vsg::ref_ptr<vsg::Framebuffer> createOffscreenFramebuffer(
     if (samples == VK_SAMPLE_COUNT_1_BIT)
     {
         imageViews.emplace_back(transferImageView);
-        imageViews.emplace_back(createTransferImageView(device, depthFormat, extent, VK_SAMPLE_COUNT_1_BIT));
+        imageViews.emplace_back(createTransferImageView(device, commandBuffer, depthFormat, extent, VK_SAMPLE_COUNT_1_BIT));
     }
     else
     {
         // MSAA
-        imageViews.emplace_back(createTransferImageView(device, imageFormat, extent, samples));
+        imageViews.emplace_back(createTransferImageView(device, commandBuffer, imageFormat, extent, samples));
         imageViews.emplace_back(transferImageView);
-        imageViews.emplace_back(createTransferImageView(device, depthFormat, extent, samples));
+        imageViews.emplace_back(createTransferImageView(device, commandBuffer, depthFormat, extent, samples));
         if (requiresDepthRead)
         {
-            imageViews.emplace_back(createTransferImageView(device, depthFormat, extent, VK_SAMPLE_COUNT_1_BIT));
+            imageViews.emplace_back(createTransferImageView(device, commandBuffer, depthFormat, extent, VK_SAMPLE_COUNT_1_BIT));
         }
     }
 
@@ -510,8 +544,8 @@ void OffscreenCommandGraph::init(VkExtent2D const& extent)
     constexpr VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     constexpr VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
 
-    auto transferImageView = createTransferImageView(device, format, extent, samples);
-    renderGraph->framebuffer = createOffscreenFramebuffer(device, transferImageView, samples);
+    auto transferImageView = createTransferImageView(device, commandBuffer, format, extent, samples);
+    renderGraph->framebuffer = createOffscreenFramebuffer(device, commandBuffer, transferImageView, samples);
     renderGraph->renderArea.extent = extent;
     renderGraph->setClearValues(
         VkClearColorValue{{0.0f, 0.0f, 0.0f, 0.0f}},
@@ -542,14 +576,14 @@ void OffscreenCommandGraph::setImageCapture(VkExtent2D const& extent, VkSampleCo
         // to handle multiple views in the same render command graph
         view->camera->viewportState->set(0, 0, extent.width, extent.height);
 
-        auto transferImageView = createTransferImageView(device, format, extent, VK_SAMPLE_COUNT_1_BIT);
+        auto transferImageView = createTransferImageView(device, commandBuffer, format, extent, VK_SAMPLE_COUNT_1_BIT);
         captureImage = createCaptureImage(device, format, extent);
 
         auto prevCaptureCommands = captureCommands;
         captureCommands = createTransferCommands(device, transferImageView->image, captureImage);
         replaceChild(this, prevCaptureCommands, captureCommands);
 
-        renderGraph->framebuffer = createOffscreenFramebuffer(device, transferImageView, samples);
+        renderGraph->framebuffer = createOffscreenFramebuffer(device, commandBuffer, transferImageView, samples);
         renderGraph->resized();
         vsg::info("offscreen render resized to: ", extent.width, "x", extent.height);
     }
