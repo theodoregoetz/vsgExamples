@@ -69,7 +69,6 @@ endif()
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/data/ DESTINATION share/vsgExamples)
 
 # pure VSG examples
-add_subdirectory(examples/core)
 add_subdirectory(examples/maths)
 add_subdirectory(examples/io)
 add_subdirectory(examples/ui)

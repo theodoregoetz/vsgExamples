@@ -18,7 +18,7 @@ std::string resolveVertShaderSource{R"(
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
 
-void main() 
+void main()
 {
     vec2 uv = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
     gl_Position = vec4(uv * 2.0f + -1.0f, 0.0f, 1.0f);
@@ -170,6 +170,24 @@ int main(int argc, char** argv)
             return 1;
         }
 
+        int gpuNumber{1};
+        auto instance = window->getOrCreateInstance();
+        (void)window->getOrCreateSurface(); // fulfill contract of getOrCreatePhysicalDevice();
+        auto& physicalDevices = instance->getPhysicalDevices();
+        if (physicalDevices.empty()) {
+            throw std::out_of_range{"No physical GPU devices reported."};
+        } else if (gpuNumber < 0 || gpuNumber >= static_cast<int32_t>(physicalDevices.size())) {
+            throw std::out_of_range{
+                std::string{"Invalid GPU number: "}
+                    .append(std::to_string(gpuNumber))
+                    .append(". ")
+                    .append("You may either specify -1 to let the system choose ")
+                    .append("or specify a physical GPU device between 0 and ")
+                    .append(std::to_string(physicalDevices.size() - 1u))
+                    .append(" inclusive.")};
+        }
+        window->setPhysicalDevice(physicalDevices[gpuNumber]);
+
         auto lookAt = vsg::LookAt::create(
             vsg::dvec3{3, 2, 2},
             vsg::dvec3{0.2, 0.2, 0.2},
@@ -193,6 +211,60 @@ int main(int argc, char** argv)
             vsg::RenderPass::Subpasses{{subpassDescription}}, vsg::RenderPass::Dependencies{})};
         auto geomFramebuffer{vsg::Framebuffer::create(geomRenderPass, vsg::ImageViews{},
             window->extent2D().width, window->extent2D().height, 1/*layers*/)};
+
+        // define a data structure for maintaining the linked list current and max node count
+        struct LinkedListCurSize
+        {
+            uint32_t count;
+            uint32_t maxNodeCount;
+        };
+        auto stagingBuffer = vsg::createBufferAndMemory(
+            window->getOrCreateDevice(),
+            sizeof(LinkedListCurSize),
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_SHARING_MODE_EXCLUSIVE,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        // Set up GeometrySBO data.
+        constexpr uint32_t MAX_FRAGMENT_NODE_COUNT{5};
+        LinkedListCurSize linkedListCurSize{
+            0,
+            MAX_FRAGMENT_NODE_COUNT * window->extent2D().width* window->extent2D().height};
+        memcpy(stagingBuffer.mapped, &linkedListCurSize, sizeof(LinkedListCurSize));
+
+        auto linkedListCurSizeBuffer = vsg::createBufferAndMemory(
+            window->getOrCreateDevice(),
+            sizeof(LinkedListCurSize),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_SHARING_MODE_EXCLUSIVE,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+
+
+
+
+        // allocate a host modifiable SSBO large enough to fit the data structure
+        auto linkedListCurSizeData{vsg::uintArray::create(2)};
+        linkedListCurSizeData->properties.dataVariance = vsg::DYNAMIC_DATA;
+
+        // map the data structure over the top of the SSBO data and initialize it
+        auto& linkedListCurSize{*reinterpret_cast<LinkedListCurSize*>(linkedListCurSizeData->data())};
+        linkedListCurSize.count = 0;
+        linkedListCurSize.maxNodeCount =
+            MAX_FRAGMENT_NODE_COUNT * window->extent2D().width* window->extent2D().height;
+        linkedListCurSizeData->dirty();
+
+        auto linkedListBufferSize{static_cast<VkDeviceSize>(
+            sizeof(FragmentNode) * linkedListCurSize.maxNodeCount)};
+        auto linkedListBuffer{vsg::createBufferAndMemory(
+            window->getOrCreateDevice(), linkedListBufferSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_SHARING_MODE_EXCLUSIVE,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+        auto linkedListInfo{vsg::BufferInfo::create()};
+        linkedListInfo->buffer = linkedListBuffer;
+        linkedListInfo->offset = 0;
+        linkedListInfo->range = linkedListBufferSize;
 
         auto headIndexImage{vsg::Image::create()};
         headIndexImage->format = VK_FORMAT_R32_UINT;
@@ -238,25 +310,6 @@ int main(int argc, char** argv)
             [&](vsg::CommandBuffer& commandBuffer) {
                 headIndexImageBarrierCommand->record(commandBuffer);
             });
-
-        // define a data structure for maintaining the linked list current and max node count
-        struct LinkedListCurSize
-        {
-            uint32_t count;
-            uint32_t maxNodeCount;
-        };
-        // allocate a host modifiable SSBO large enough to fit the data structure
-        auto linkedListCurSizeData{vsg::uintArray::create(
-            sizeof(LinkedListCurSize)/sizeof(vsg::uintArray::value_type) + sizeof(vsg::uintArray::value_type))};
-        linkedListCurSizeData->properties.dataVariance = vsg::DYNAMIC_DATA;
-
-        // map the data structure over the top of the SSBO data and initialize it
-        constexpr uint32_t MAX_FRAGMENT_NODE_COUNT{5};
-        auto& linkedListCurSize{*reinterpret_cast<LinkedListCurSize*>(linkedListCurSizeData->data())};
-        linkedListCurSize.count = 0;
-        linkedListCurSize.maxNodeCount =
-            MAX_FRAGMENT_NODE_COUNT * window->extent2D().width* window->extent2D().height;
-        linkedListCurSizeData->dirty();
 
         // define a fragment node data structure to collect in the geometry pass and sort in the resolve pass
         struct FragmentNode
@@ -424,7 +477,7 @@ int main(int argc, char** argv)
             {
                 vkCmdDraw(commandBuffer, 3, 1, 0, 0);
             }
-        
+
         protected:
             ~FabricatedTriangleDraw() override = default;
         };
@@ -482,7 +535,7 @@ int main(int argc, char** argv)
             {
                 vkCmdFillBuffer(commandBuffer, buffer->vk(commandBuffer.deviceID), dstOffset, dataSize, data);
             }
-        
+
         protected:
             ~FillBuffer() override = default;
         };
