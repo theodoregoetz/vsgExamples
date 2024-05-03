@@ -184,6 +184,16 @@ int main(int argc, char** argv)
         viewer->addEventHandler(vsg::CloseHandler::create(viewer));
         viewer->addEventHandler(vsg::Trackball::create(camera));
 
+        // create the geometry frame buffer
+        vsg::SubpassDescription subpassDescription{};
+        subpassDescription.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+
+        // geometry render pass doesn't need any output attachments
+        auto geomRenderPass{vsg::RenderPass::create(window->getOrCreateDevice(), vsg::RenderPass::Attachments{},
+            vsg::RenderPass::Subpasses{{subpassDescription}}, vsg::RenderPass::Dependencies{})};
+        auto geomFramebuffer{vsg::Framebuffer::create(geomRenderPass, vsg::ImageViews{},
+            window->extent2D().width, window->extent2D().height, 1/*layers*/)};
+
         auto headIndexImage{vsg::Image::create()};
         headIndexImage->format = VK_FORMAT_R32_UINT;
         headIndexImage->extent.width = window->extent2D().width;
@@ -218,16 +228,16 @@ int main(int argc, char** argv)
         headIndexImageBarrier->subresourceRange.layerCount = 1;
         headIndexImageBarrier->subresourceRange.levelCount = 1;
 
-        // TODO: need to submit this layout transition barrier command to the queue and wait for it
+        // change headIndexImage's layout from UNDEFINED to GENERAL
         auto headIndexImageBarrierCommand{vsg::PipelineBarrier::create(
             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, headIndexImageBarrier)};
-
-        // create a memory barrier to ensure all writes are finished before we start to write again
-        auto memoryBarrier{vsg::MemoryBarrier::create()};
-        memoryBarrier->srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        memoryBarrier->dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        auto memoryBarrierCommand{vsg::PipelineBarrier::create(
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, memoryBarrier)};
+        auto queueFamilyIndex{window->getOrCreatePhysicalDevice()->getQueueFamily(VK_QUEUE_GRAPHICS_BIT)};
+        auto commandPool{vsg::CommandPool::create(window->getOrCreateDevice(), queueFamilyIndex)};
+        auto queue{window->getOrCreateDevice()->getQueue(queueFamilyIndex)};
+        vsg::submitCommandsToQueue(commandPool, nullptr, 0, queue,
+            [&](vsg::CommandBuffer& commandBuffer) {
+                headIndexImageBarrierCommand->record(commandBuffer);
+            });
 
         // define a data structure for maintaining the linked list current and max node count
         struct LinkedListCurSize
@@ -238,6 +248,7 @@ int main(int argc, char** argv)
         // allocate a host modifiable SSBO large enough to fit the data structure
         auto linkedListCurSizeData{vsg::uintArray::create(
             sizeof(LinkedListCurSize)/sizeof(vsg::uintArray::value_type) + sizeof(vsg::uintArray::value_type))};
+        linkedListCurSizeData->properties.dataVariance = vsg::DYNAMIC_DATA;
 
         // map the data structure over the top of the SSBO data and initialize it
         constexpr uint32_t MAX_FRAGMENT_NODE_COUNT{5};
@@ -245,6 +256,7 @@ int main(int argc, char** argv)
         linkedListCurSize.count = 0;
         linkedListCurSize.maxNodeCount =
             MAX_FRAGMENT_NODE_COUNT * window->extent2D().width* window->extent2D().height;
+        linkedListCurSizeData->dirty();
 
         // define a fragment node data structure to collect in the geometry pass and sort in the resolve pass
         struct FragmentNode
@@ -420,14 +432,104 @@ int main(int argc, char** argv)
         resolveStateGroup->addChild(FabricatedTriangleDraw::create());
 
         /*
-         * Separate the geometry pass from the resolve pass, separated by the headIndexImage
-         * barrier, each into its own render graph for proper synchronization of the headIndexImage
-         * buffer.
+         * Command graph
          */
         auto commandGraph{vsg::CommandGraph::create(window)};
-        commandGraph->addChild(vsg::createRenderGraphForView(window, camera, geomStateGroup));
-        commandGraph->addChild(headIndexImageBarrierCommand);
-        commandGraph->addChild(vsg::createRenderGraphForView(window, camera, resolveStateGroup));
+
+        VkClearColorValue headImageClearColor;
+        headImageClearColor.uint32[0] = 0xffffffff;
+
+        VkImageSubresourceRange subresRange{};
+        subresRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        subresRange.levelCount = 1;
+        subresRange.layerCount = 1;
+
+        auto headImageClearColorCommand{vsg::ClearColorImage::create()};
+        headImageClearColorCommand->image = headIndexImage;
+        headImageClearColorCommand->imageLayout = headIndexImageInfo->imageLayout;
+        headImageClearColorCommand->color = headImageClearColor;
+        headImageClearColorCommand->ranges.push_back(subresRange);
+
+        commandGraph->addChild(headImageClearColorCommand);
+
+#if 0
+        class FillBuffer : public vsg::Inherit<vsg::Command, FillBuffer>
+        {
+        public:
+            vsg::ref_ptr<Buffer> buffer;
+            VkDeviceSize dstOffset;
+            VkDeviceSize dataSize;
+            uint32_t data;
+
+            FillBuffer(vsg::ref_ptr<Buffer> in_buffer,
+                       VkDeviceSize in_dstOffset,
+                       VkDeviceSize in_dataSize,
+                       uint32_t in_data)
+                : Inherit{}
+                , buffer{in_buffer}
+                , dstOffset{in_dstOffset}
+                , dataSize{in_dataSize}
+                , data{in_data}
+            {
+            }
+
+            FillBuffer(FillBuffer const& rhs, vsg::CopyOp const& copyop = {})
+                : Inherit(rhs, copyop)
+            {
+            }
+
+            void record(vsg::CommandBuffer& commandBuffer) const override
+            {
+                vkCmdFillBuffer(commandBuffer, buffer->vk(commandBuffer.deviceID), dstOffset, dataSize, data);
+            }
+        
+        protected:
+            ~FillBuffer() override = default;
+        };
+
+        commandGraph->addChild(FillBuffer::create());
+#else
+        linkedListCurSize.count = 0;
+        linkedListCurSizeData->dirty();
+#endif
+
+        // create a memory barrier to ensure all writes are finished before we start to write again
+        {
+            auto memoryBarrier{vsg::MemoryBarrier::create()};
+            memoryBarrier->srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            memoryBarrier->dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            auto memoryBarrierCommand{vsg::PipelineBarrier::create(
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, memoryBarrier)};
+            commandGraph->addChild(memoryBarrierCommand);
+        }
+
+        auto view{vsg::View::create(camera)};
+        view->addChild(geomStateGroup);
+
+        auto geomRenderGraph{vsg::RenderGraph::create()};
+        geomRenderGraph->renderArea.offset = {0, 0};
+        geomRenderGraph->renderArea.extent = window->extent2D();
+        geomRenderGraph->framebuffer = geomFramebuffer;
+        geomRenderGraph->addChild(view);
+        commandGraph->addChild(geomRenderGraph);
+
+        // ensure geometry pass is complete before starting the resolve pass
+        commandGraph->addChild(vsg::PipelineBarrier::create(
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0));
+
+        // create a memory barrier to ensure all writes are finished before we start to write again
+        {
+            auto memoryBarrier{vsg::MemoryBarrier::create()};
+            memoryBarrier->srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            memoryBarrier->dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            auto memoryBarrierCommand{vsg::PipelineBarrier::create(
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, memoryBarrier)};
+            commandGraph->addChild(memoryBarrierCommand);
+        }
+
+        auto resolveRenderGraph{vsg::createRenderGraphForView(window, camera, resolveStateGroup)};
+        resolveRenderGraph->setClearValues({{0.025f, 0.025f, 0.025f, 1.0f}}, {1.0f, 0});
+        commandGraph->addChild(resolveRenderGraph);
 
         viewer->assignRecordAndSubmitTaskAndPresentation({commandGraph});
         viewer->compile();
