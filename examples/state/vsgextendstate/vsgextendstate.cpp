@@ -4,50 +4,147 @@
 #include "vsg/all.h"
 
 
-class ExtendedRasterizationState : public vsg::Inherit<vsg::RasterizationState, ExtendedRasterizationState>
-{
-public:
-    ExtendedRasterizationState() {}
-    ExtendedRasterizationState(const ExtendedRasterizationState& rs) : Inherit(rs) {}
-
-    void apply(vsg::Context& context, VkGraphicsPipelineCreateInfo& pipelineInfo) const override
-    {
-        // create and assign the VkPipelineRasterizationStateCreateInfo as usual using the base class that wil assign it to pipelineInfo.pRasterizationState
-        RasterizationState::apply(context, pipelineInfo);
-
-        /// setup extension feature (stippling) for attachment to pNext below
-        auto rastLineStateCreateInfo = context.scratchMemory->allocate<VkPipelineRasterizationLineStateCreateInfoEXT>(1);
-        rastLineStateCreateInfo->sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_EXT;
-        rastLineStateCreateInfo->pNext = nullptr;
-        rastLineStateCreateInfo->lineRasterizationMode = VK_LINE_RASTERIZATION_MODE_DEFAULT_EXT;
-        rastLineStateCreateInfo->stippledLineEnable = VK_TRUE;
-        rastLineStateCreateInfo->lineStippleFactor = 4;
-        rastLineStateCreateInfo->lineStipplePattern = 0b1111111100000000;
-
-        // to assign rastLineStateCreateInfo to the pRasterizationState->pNext we have to cast away const first
-        // this is safe as these objects haven't been passed to Vulkan yet
-        auto pRasterizationState = const_cast<VkPipelineRasterizationStateCreateInfo*>(pipelineInfo.pRasterizationState);
-        pRasterizationState->pNext = rastLineStateCreateInfo;
-    }
-
-protected:
-    virtual ~ExtendedRasterizationState() {}
-};
-
-std::string VERT{R"(
+std::string geomVertShaderSource{R"(
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
+
 layout(push_constant) uniform PushConstants { mat4 projection; mat4 modelView; };
 layout(location = 0) in vec3 vertex;
 out gl_PerVertex { vec4 gl_Position; };
 void main() { gl_Position = (projection * modelView) * vec4(vertex, 1.0); }
 )"};
 
-std::string FRAG{R"(
+std::string resolveVertShaderSource{R"(
 #version 450
 #extension GL_ARB_separate_shader_objects : enable
-layout(location = 0) out vec4 color;
-void main() { color = vec4(1, 0, 0, 1); }
+
+void main() 
+{
+    vec2 uv = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
+    gl_Position = vec4(uv * 2.0f + -1.0f, 0.0f, 1.0f);
+}
+)"};
+
+std::string geomFragShaderSource{R"(
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#pragma import_defines ( OIT )
+
+#define OIT 1
+#if defined(OIT)
+    layout (early_fragment_tests) in;
+
+    struct Node
+    {
+        vec4 color;
+        float depth;
+        uint next;
+    };
+
+    layout (set = 0, binding = 1) buffer GeometrySBO
+    {
+        uint count;
+        uint maxNodeCount;
+    };
+
+    layout (set = 0, binding = 2, r32ui) uniform coherent uimage2D headIndexImage;
+
+    layout (set = 0, binding = 3) buffer LinkedListSBO
+    {
+        Node nodes[];
+    };
+#else
+    layout(location = 0) out vec4 outFragColor;
+#endif
+
+void main() {
+    float a = gl_PrimitiveID*0.1;
+    float b = 1.0-gl_PrimitiveID*0.1;
+    vec4 color;
+    if (gl_PrimitiveID % 2 == 0)
+        color = vec4(a, b, 0, 0.5);
+    else
+        color = vec4(b, a, 0, 0.5);
+
+    #if defined(OIT)
+        // Increase the node count
+        uint nodeIdx = atomicAdd(count, 1);
+
+        // Check LinkedListSBO is full
+        if (nodeIdx < maxNodeCount)
+        {
+            // Exchange new head index and previous head index
+            uint prevHeadIdx = imageAtomicExchange(headIndexImage, ivec2(gl_FragCoord.xy), nodeIdx);
+
+            // Store node data
+            nodes[nodeIdx].color = color;
+            nodes[nodeIdx].depth = gl_FragCoord.z;
+            nodes[nodeIdx].next = prevHeadIdx;
+        }
+    #else
+        outFragColor = color;
+    #endif
+}
+)"};
+
+std::string resolveFragShaderSource{R"(
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+
+#define MAX_FRAGMENT_COUNT 128
+
+struct Node
+{
+    vec4 color;
+    float depth;
+    uint next;
+};
+
+layout (location = 0) out vec4 outFragColor;
+
+layout (set = 0, binding = 0, r32ui) uniform uimage2D headIndexImage;
+
+layout (set = 0, binding = 1) buffer LinkedListSBO
+{
+    Node nodes[];
+};
+
+void main()
+{
+    Node fragments[MAX_FRAGMENT_COUNT];
+    int count = 0;
+
+    uint nodeIdx = imageLoad(headIndexImage, ivec2(gl_FragCoord.xy)).r;
+
+    while (nodeIdx != 0xffffffff && count < MAX_FRAGMENT_COUNT)
+    {
+        fragments[count] = nodes[nodeIdx];
+        nodeIdx = fragments[count].next;
+        ++count;
+    }
+
+    // Do the insertion sort
+    for (uint i = 1; i < count; ++i)
+    {
+        Node insert = fragments[i];
+        uint j = i;
+        while (j > 0 && insert.depth > fragments[j - 1].depth)
+        {
+            fragments[j] = fragments[j-1];
+            --j;
+        }
+        fragments[j] = insert;
+    }
+
+    // Do blending
+    vec4 color = vec4(0.025, 0.025, 0.025, 1.0f);
+    for (int i = 0; i < count; ++i)
+    {
+        color = mix(color, fragments[i].color, fragments[i].color.a);
+    }
+
+    outFragColor = color;
+}
 )"};
 
 int main(int argc, char** argv)
@@ -60,14 +157,10 @@ int main(int argc, char** argv)
         windowTraits->debugLayer = arguments.read({"--debug", "-d"});
         windowTraits->apiDumpLayer = arguments.read({"--api", "-a"});
         windowTraits->windowTitle = "vsgextendstate";
-
-        auto requestFeatures = windowTraits->deviceFeatures = vsg::DeviceFeatures::create();
-
+        windowTraits->deviceFeatures = vsg::DeviceFeatures::create();
+        windowTraits->deviceFeatures->get().geometryShader = VK_TRUE; // for gl_PrimitiveID
+        windowTraits->deviceFeatures->get().fragmentStoresAndAtomics = VK_TRUE;
         windowTraits->vulkanVersion = VK_API_VERSION_1_1;
-        windowTraits->deviceExtensionNames.push_back(VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME);
-
-        /// enable wideLines feature
-        requestFeatures->get().wideLines = VK_TRUE;
 
         // create window now we have configured the windowTraits to set up the required features
         auto window = vsg::Window::create(windowTraits);
@@ -76,75 +169,6 @@ int main(int argc, char** argv)
             std::cout << "Unable to create window" << std::endl;
             return 1;
         }
-
-        auto physicalDevice = window->getOrCreatePhysicalDevice();
-        if (!physicalDevice->supportsDeviceExtension(VK_EXT_LINE_RASTERIZATION_EXTENSION_NAME))
-        {
-            std::cout << "Line Rasterization Extension not supported.\n";
-            return 1;
-        }
-
-        auto supportedLineRasterizationFeatures = window->getOrCreatePhysicalDevice()->getFeatures<VkPhysicalDeviceLineRasterizationFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT>();
-        std::cout<<"LineRasterizationFeatures features supported: "<<std::endl;
-        std::cout<<"    rectangularLines : "<<supportedLineRasterizationFeatures.rectangularLines<<std::endl;
-        std::cout<<"    bresenhamLines : "<<supportedLineRasterizationFeatures.bresenhamLines<<std::endl;
-        std::cout<<"    smoothLines : "<<supportedLineRasterizationFeatures.smoothLines<<std::endl;
-        std::cout<<"    stippledRectangularLines : "<<supportedLineRasterizationFeatures.stippledRectangularLines<<std::endl;
-        std::cout<<"    stippledBresenhamLines : "<<supportedLineRasterizationFeatures.stippledBresenhamLines<<std::endl;
-        std::cout<<"    stippledSmoothLines : "<<supportedLineRasterizationFeatures.stippledSmoothLines<<std::endl;
-
-        /// enable stippled line extension features
-        auto& requestedLineRasterizationFeatures = requestFeatures->get<VkPhysicalDeviceLineRasterizationFeaturesEXT, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_LINE_RASTERIZATION_FEATURES_EXT>();
-        if (supportedLineRasterizationFeatures.stippledRectangularLines) requestedLineRasterizationFeatures.stippledRectangularLines = VK_TRUE;
-        if (supportedLineRasterizationFeatures.bresenhamLines) requestedLineRasterizationFeatures.bresenhamLines = VK_TRUE;
-
-        auto sceneGraph = vsg::Group::create();
-
-        auto vertexShader = vsg::ShaderStage::create(VK_SHADER_STAGE_VERTEX_BIT, "main", VERT);
-        auto fragmentShader = vsg::ShaderStage::create(VK_SHADER_STAGE_FRAGMENT_BIT, "main", FRAG);
-        auto shaderSet = vsg::ShaderSet::create(vsg::ShaderStages{vertexShader, fragmentShader});
-        shaderSet->addPushConstantRange("pc", "", VK_SHADER_STAGE_VERTEX_BIT, 0, 128);
-        shaderSet->addAttributeBinding("vertex", "", 0, VK_FORMAT_R32G32B32_SFLOAT, vsg::vec3Array::create(1));
-
-        auto stateGroup = vsg::StateGroup::create();
-        auto gpConf = vsg::GraphicsPipelineConfigurator::create(shaderSet);
-
-        auto vertices = vsg::vec3Array::create({
-            {0, 0, 0},
-            {1, 0, 0},
-            {0, 1, 0},
-            {0, 0, 1},
-        });
-        vsg::DataList vertexArrays;
-        gpConf->assignArray(vertexArrays, "vertex", VK_VERTEX_INPUT_RATE_VERTEX, vertices);
-        auto vertexDraw = vsg::VertexDraw::create();
-        vertexDraw->assignArrays(vertexArrays);
-        vertexDraw->vertexCount = vertices->width();
-        vertexDraw->instanceCount = 1;
-        stateGroup->addChild(vertexDraw);
-
-        struct SetPipelineStates : public vsg::Visitor
-        {
-            void apply(vsg::Object& object) { object.traverse(*this); }
-            void apply(vsg::RasterizationState& rs)
-            {
-                rs.lineWidth = 10.0f;
-                rs.cullMode = VK_CULL_MODE_NONE;
-            }
-            void apply(vsg::InputAssemblyState& ias)
-            {
-                ias.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
-            }
-        } sps;
-
-        /// apply our custom RasterizationState to the GraphicsPipeline
-        auto rs = ExtendedRasterizationState::create();
-        gpConf->pipelineStates.push_back(rs);
-
-        gpConf->accept(sps);
-        gpConf->init();
-        gpConf->copyTo(stateGroup);
-        sceneGraph->addChild(stateGroup);
 
         auto lookAt = vsg::LookAt::create(
             vsg::dvec3{3, 2, 2},
@@ -160,7 +184,251 @@ int main(int argc, char** argv)
         viewer->addEventHandler(vsg::CloseHandler::create(viewer));
         viewer->addEventHandler(vsg::Trackball::create(camera));
 
-        auto commandGraph = vsg::createCommandGraphForView(window, camera, sceneGraph);
+        auto headIndexImage{vsg::Image::create()};
+        headIndexImage->format = VK_FORMAT_R32_UINT;
+        headIndexImage->extent.width = window->extent2D().width;
+        headIndexImage->extent.height = window->extent2D().height;
+        headIndexImage->extent.depth = 1;
+        headIndexImage->mipLevels = 1;
+        headIndexImage->arrayLayers = 1;
+        headIndexImage->samples = VK_SAMPLE_COUNT_1_BIT;
+        #if defined VK_USE_PLATFORM_MACOS_MVK
+            // SRS - On macOS/iOS use linear tiling for atomic image access.
+            // see https://github.com/KhronosGroup/MoltenVK/issues/1027
+            headIndexImage->tiling = VK_IMAGE_TILING_LINEAR;
+        #else
+            headIndexImage->tiling = VK_IMAGE_TILING_OPTIMAL;
+        #endif
+        headIndexImage->usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+
+        auto headIndexImageInfo{vsg::ImageInfo::create()};
+        headIndexImageInfo->imageView = vsg::createImageView(
+            window->getOrCreateDevice(), headIndexImage, VK_IMAGE_ASPECT_COLOR_BIT);
+        headIndexImageInfo->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+        // create a barrier to change headIndexImage's layout from UNDEFINED to GENERAL
+        auto headIndexImageBarrier{vsg::ImageMemoryBarrier::create()};
+        headIndexImageBarrier->srcAccessMask = 0;
+        headIndexImageBarrier->dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        headIndexImageBarrier->oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        headIndexImageBarrier->newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        headIndexImageBarrier->image = headIndexImage;
+        headIndexImageBarrier->subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        headIndexImageBarrier->subresourceRange.baseArrayLayer = 0;
+        headIndexImageBarrier->subresourceRange.layerCount = 1;
+        headIndexImageBarrier->subresourceRange.levelCount = 1;
+
+        // TODO: need to submit this layout transition barrier command to the queue and wait for it
+        auto headIndexImageBarrierCommand{vsg::PipelineBarrier::create(
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, headIndexImageBarrier)};
+
+        // create a memory barrier to ensure all writes are finished before we start to write again
+        auto memoryBarrier{vsg::MemoryBarrier::create()};
+        memoryBarrier->srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        memoryBarrier->dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        auto memoryBarrierCommand{vsg::PipelineBarrier::create(
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, memoryBarrier)};
+
+        // define a data structure for maintaining the linked list current and max node count
+        struct LinkedListCurSize
+        {
+            uint32_t count;
+            uint32_t maxNodeCount;
+        };
+        // allocate a host modifiable SSBO large enough to fit the data structure
+        auto linkedListCurSizeData{vsg::uintArray::create(
+            sizeof(LinkedListCurSize)/sizeof(vsg::uintArray::value_type) + sizeof(vsg::uintArray::value_type))};
+
+        // map the data structure over the top of the SSBO data and initialize it
+        constexpr uint32_t MAX_FRAGMENT_NODE_COUNT{5};
+        auto& linkedListCurSize{*reinterpret_cast<LinkedListCurSize*>(linkedListCurSizeData->data())};
+        linkedListCurSize.count = 0;
+        linkedListCurSize.maxNodeCount =
+            MAX_FRAGMENT_NODE_COUNT * window->extent2D().width* window->extent2D().height;
+
+        // define a fragment node data structure to collect in the geometry pass and sort in the resolve pass
+        struct FragmentNode
+        {
+            vsg::vec4 color;
+            float     depth;
+            uint32_t  next;
+        };
+
+        // allocate a device only SSBO to hold the data structure
+        auto linkedListBufferSize{static_cast<VkDeviceSize>(
+            sizeof(FragmentNode) * linkedListCurSize.maxNodeCount)};
+        auto linkedListBuffer{vsg::createBufferAndMemory(
+            window->getOrCreateDevice(), linkedListBufferSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_SHARING_MODE_EXCLUSIVE,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+        auto linkedListInfo{vsg::BufferInfo::create()};
+        linkedListInfo->buffer = linkedListBuffer;
+        linkedListInfo->offset = 0;
+        linkedListInfo->range = linkedListBufferSize;
+
+        // geometry pipeline construction
+        vsg::DescriptorSetLayoutBindings geomDescriptorBindings{
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}
+        };
+        auto geomLinkedListCurSizeInfoDesc{vsg::DescriptorBuffer::create(linkedListCurSizeData,
+            1, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
+        auto geomHeadIndexImageDesc{vsg::DescriptorImage::create(headIndexImageInfo,
+            2, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)};
+        auto geomLinkedListDesc{vsg::DescriptorBuffer::create(vsg::BufferInfoList{linkedListInfo},
+            3, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
+
+        auto geomDescriptorSetLayout{vsg::DescriptorSetLayout::create(geomDescriptorBindings)};
+        auto geomDescriptorSet{vsg::DescriptorSet::create(geomDescriptorSetLayout,
+            vsg::Descriptors{geomLinkedListCurSizeInfoDesc,geomHeadIndexImageDesc,geomLinkedListDesc})};
+
+        vsg::VertexInputState::Bindings geomVertexBindingsDescriptions{
+            VkVertexInputBindingDescription{0, sizeof(vsg::vec3), VK_VERTEX_INPUT_RATE_VERTEX}, // vertex data
+        };
+
+        vsg::VertexInputState::Attributes geomVertexAttributeDescriptions{
+            VkVertexInputAttributeDescription{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, // vertex data
+        };
+
+        auto inputAssemblyState{vsg::InputAssemblyState::create(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)};
+        auto rasterizationState{vsg::RasterizationState::create()};
+        rasterizationState->cullMode = VK_CULL_MODE_NONE;
+        auto depthStencilState{vsg::DepthStencilState::create()};
+        depthStencilState->depthTestEnable = VK_FALSE;
+        depthStencilState->depthWriteEnable = VK_FALSE;
+        depthStencilState->depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+        vsg::GraphicsPipelineStates geomPipelineStates{
+            vsg::VertexInputState::create(geomVertexBindingsDescriptions, geomVertexAttributeDescriptions),
+            inputAssemblyState,
+            rasterizationState,
+            vsg::MultisampleState::create(),
+            vsg::ColorBlendState::create(),
+            depthStencilState
+        };
+
+        vsg::PushConstantRanges pushConstantRanges{
+            {VK_SHADER_STAGE_VERTEX_BIT, 0, 128} // projection, view, and model matrices, actual push constant calls automatically provided by the VSG's RecordTraversal
+        };
+        auto geomPipelineLayout{vsg::PipelineLayout::create(
+            vsg::DescriptorSetLayouts{geomDescriptorSetLayout}, pushConstantRanges)};
+
+        auto geomVertShader = vsg::ShaderStage::create(VK_SHADER_STAGE_VERTEX_BIT, "main", geomVertShaderSource);
+        auto geomFragShader = vsg::ShaderStage::create(VK_SHADER_STAGE_FRAGMENT_BIT, "main", geomFragShaderSource);
+        auto geomShaderStages{vsg::ShaderStages{geomVertShader, geomFragShader}};
+        auto geomGraphicsPipeline{vsg::GraphicsPipeline::create(
+            geomPipelineLayout, geomShaderStages, geomPipelineStates)};
+
+        auto geomBindGraphicsPipeline{vsg::BindGraphicsPipeline::create(geomGraphicsPipeline)};
+        auto geomBindDescriptorSet{vsg::BindDescriptorSet::create(
+            VK_PIPELINE_BIND_POINT_GRAPHICS, geomGraphicsPipeline->layout, 0, geomDescriptorSet)};
+
+        // resolve pipeline construction
+        vsg::DescriptorSetLayoutBindings resolveDescriptorBindings{
+            {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}
+        };
+        auto resolveHeadIndexImageDesc{vsg::DescriptorImage::create(headIndexImageInfo,
+            0, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)};
+        auto resolveLinkedListDesc{vsg::DescriptorBuffer::create(vsg::BufferInfoList{linkedListInfo},
+            1, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
+
+        auto resolveDescriptorSetLayout{vsg::DescriptorSetLayout::create(resolveDescriptorBindings)};
+        auto resolveDescriptorSet{vsg::DescriptorSet::create(resolveDescriptorSetLayout,
+            vsg::Descriptors{resolveHeadIndexImageDesc,resolveLinkedListDesc})};
+
+        vsg::GraphicsPipelineStates resolvePipelineStates{
+            vsg::VertexInputState::create(),
+            inputAssemblyState,
+            rasterizationState,
+            vsg::MultisampleState::create(),
+            vsg::ColorBlendState::create(),
+            depthStencilState
+        };
+        auto resolvePipelineLayout{vsg::PipelineLayout::create(
+            vsg::DescriptorSetLayouts{resolveDescriptorSetLayout}, vsg::PushConstantRanges{})};
+
+        auto resolveVertShader = vsg::ShaderStage::create(VK_SHADER_STAGE_VERTEX_BIT, "main", resolveVertShaderSource);
+        auto resolveFragShader = vsg::ShaderStage::create(VK_SHADER_STAGE_FRAGMENT_BIT, "main", resolveFragShaderSource);
+        auto resolveShaderStages{vsg::ShaderStages{resolveVertShader, resolveFragShader}};
+        auto resolveGraphicsPipeline{vsg::GraphicsPipeline::create(
+            resolvePipelineLayout, resolveShaderStages, resolvePipelineStates)};
+
+        auto resolveBindGraphicsPipeline{vsg::BindGraphicsPipeline::create(resolveGraphicsPipeline)};
+        auto resolveBindDescriptorSet{vsg::BindDescriptorSet::create(
+            VK_PIPELINE_BIND_POINT_GRAPHICS, resolveGraphicsPipeline->layout, 0, resolveDescriptorSet)};
+
+        // setup the geometry state group
+        auto geomStateGroup{vsg::StateGroup::create()};
+        geomStateGroup->add(geomBindGraphicsPipeline);
+        geomStateGroup->add(geomBindDescriptorSet);
+
+        // render the geometry scene
+        std::vector<vsg::ref_ptr<vsg::vec3Array>> vertices{{
+            vsg::vec3Array::create({
+                {0, 0, 0},
+                {1, 0, 0},
+                {0, 1, 0},
+                {0, 0, 1},
+                {1, 0, 1},
+                {1, 1, 1}
+            }),
+            vsg::vec3Array::create({
+                {0, 0, 0.5},
+                {1, 0, 0.5},
+                {0, 1, 0.5},
+                {0, 0, 1.5},
+                {1, 0, 1.5},
+                {1, 1, 1.5}
+            })
+        }};
+
+        for (auto& verts : vertices) {
+            vsg::DataList vertexArrays{{verts}};
+            auto vertexDraw{vsg::VertexDraw::create()};
+            vertexDraw->assignArrays(vertexArrays);
+            vertexDraw->vertexCount = verts->width();
+            vertexDraw->instanceCount = 1;
+            geomStateGroup->addChild(vertexDraw);
+        }
+
+        // setup the resolve state group
+        auto resolveStateGroup{vsg::StateGroup::create()};
+        resolveStateGroup->add(resolveBindGraphicsPipeline);
+        resolveStateGroup->add(resolveBindDescriptorSet);
+
+        // render the resolve scene which is just a triangle fabricated in the resolve vertex shader
+        class FabricatedTriangleDraw : public vsg::Inherit<vsg::Command, FabricatedTriangleDraw>
+        {
+        public:
+            FabricatedTriangleDraw() = default;
+            FabricatedTriangleDraw(FabricatedTriangleDraw const& rhs, vsg::CopyOp const& copyop = {})
+                : Inherit(rhs, copyop)
+            {
+            }
+
+            void record(vsg::CommandBuffer& commandBuffer) const override
+            {
+                vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+            }
+        
+        protected:
+            ~FabricatedTriangleDraw() override = default;
+        };
+
+        resolveStateGroup->addChild(FabricatedTriangleDraw::create());
+
+        /*
+         * Separate the geometry pass from the resolve pass, separated by the headIndexImage
+         * barrier, each into its own render graph for proper synchronization of the headIndexImage
+         * buffer.
+         */
+        auto commandGraph{vsg::CommandGraph::create(window)};
+        commandGraph->addChild(vsg::createRenderGraphForView(window, camera, geomStateGroup));
+        commandGraph->addChild(headIndexImageBarrierCommand);
+        commandGraph->addChild(vsg::createRenderGraphForView(window, camera, resolveStateGroup));
+
         viewer->assignRecordAndSubmitTaskAndPresentation({commandGraph});
         viewer->compile();
 
