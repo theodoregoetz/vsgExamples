@@ -224,13 +224,11 @@ int main(int argc, char** argv)
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             VK_SHARING_MODE_EXCLUSIVE,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-        // Set up GeometrySBO data.
-        constexpr uint32_t MAX_FRAGMENT_NODE_COUNT{5};
-        LinkedListCurSize linkedListCurSize{
-            0,
-            MAX_FRAGMENT_NODE_COUNT * window->extent2D().width* window->extent2D().height};
-        memcpy(stagingBuffer.mapped, &linkedListCurSize, sizeof(LinkedListCurSize));
+        auto stagingBufferMemory{stagingBuffer->getDeviceMemory(window->getOrCreateDevice())};
+        VkResult map(VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags, void** ppData);
+        void* stagingBufferMappedMemory{};
+        auto vkResult{stagingBufferMemory->map(0, sizeof(LinkedListCurSize), 0, &stagingBufferMappedMemory)};
+        assert(vkResult == VK_SUCCESS);
 
         auto linkedListCurSizeBuffer = vsg::createBufferAndMemory(
             window->getOrCreateDevice(),
@@ -239,33 +237,21 @@ int main(int argc, char** argv)
             VK_SHARING_MODE_EXCLUSIVE,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
+        // Set up GeometrySBO data.
+        constexpr uint32_t MAX_FRAGMENT_NODE_COUNT{5};
+        LinkedListCurSize linkedListCurSize{
+            0,
+            MAX_FRAGMENT_NODE_COUNT * window->extent2D().width * window->extent2D().height};
+        memcpy(stagingBufferMappedMemory, &linkedListCurSize, sizeof(LinkedListCurSize));
+
+        // TODO: need to data from stagingBuffer to linkedListCurSizeBuffer
+        stagingBuffer.reset(); // after copy we no longer need the staging buffer
 
 
 
 
-        // allocate a host modifiable SSBO large enough to fit the data structure
-        auto linkedListCurSizeData{vsg::uintArray::create(2)};
-        linkedListCurSizeData->properties.dataVariance = vsg::DYNAMIC_DATA;
 
-        // map the data structure over the top of the SSBO data and initialize it
-        auto& linkedListCurSize{*reinterpret_cast<LinkedListCurSize*>(linkedListCurSizeData->data())};
-        linkedListCurSize.count = 0;
-        linkedListCurSize.maxNodeCount =
-            MAX_FRAGMENT_NODE_COUNT * window->extent2D().width* window->extent2D().height;
-        linkedListCurSizeData->dirty();
-
-        auto linkedListBufferSize{static_cast<VkDeviceSize>(
-            sizeof(FragmentNode) * linkedListCurSize.maxNodeCount)};
-        auto linkedListBuffer{vsg::createBufferAndMemory(
-            window->getOrCreateDevice(), linkedListBufferSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VK_SHARING_MODE_EXCLUSIVE,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
-        auto linkedListInfo{vsg::BufferInfo::create()};
-        linkedListInfo->buffer = linkedListBuffer;
-        linkedListInfo->offset = 0;
-        linkedListInfo->range = linkedListBufferSize;
-
+        // create a texture for the headIndex to track the head index of each fragment
         auto headIndexImage{vsg::Image::create()};
         headIndexImage->format = VK_FORMAT_R32_UINT;
         headIndexImage->extent.width = window->extent2D().width;
@@ -287,6 +273,29 @@ int main(int argc, char** argv)
         headIndexImageInfo->imageView = vsg::createImageView(
             window->getOrCreateDevice(), headIndexImage, VK_IMAGE_ASPECT_COLOR_BIT);
         headIndexImageInfo->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+
+        // define a fragment node data structure to collect in the geometry pass and sort in the resolve pass
+        struct FragmentNode
+        {
+            vsg::vec4 color;
+            float     depth;
+            uint32_t  next;
+        };
+
+        // create a buffer for the fragment linked list
+        auto linkedListBufferSize{static_cast<VkDeviceSize>(
+            sizeof(FragmentNode) * linkedListCurSize.maxNodeCount)};
+        auto linkedListBuffer{vsg::createBufferAndMemory(
+            window->getOrCreateDevice(), linkedListBufferSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_SHARING_MODE_EXCLUSIVE,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
+        auto linkedListInfo{vsg::BufferInfo::create()};
+        linkedListInfo->buffer = linkedListBuffer;
+        linkedListInfo->offset = 0;
+        linkedListInfo->range = linkedListBufferSize;
+
 
         // create a barrier to change headIndexImage's layout from UNDEFINED to GENERAL
         auto headIndexImageBarrier{vsg::ImageMemoryBarrier::create()};
@@ -310,27 +319,6 @@ int main(int argc, char** argv)
             [&](vsg::CommandBuffer& commandBuffer) {
                 headIndexImageBarrierCommand->record(commandBuffer);
             });
-
-        // define a fragment node data structure to collect in the geometry pass and sort in the resolve pass
-        struct FragmentNode
-        {
-            vsg::vec4 color;
-            float     depth;
-            uint32_t  next;
-        };
-
-        // allocate a device only SSBO to hold the data structure
-        auto linkedListBufferSize{static_cast<VkDeviceSize>(
-            sizeof(FragmentNode) * linkedListCurSize.maxNodeCount)};
-        auto linkedListBuffer{vsg::createBufferAndMemory(
-            window->getOrCreateDevice(), linkedListBufferSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VK_SHARING_MODE_EXCLUSIVE,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)};
-        auto linkedListInfo{vsg::BufferInfo::create()};
-        linkedListInfo->buffer = linkedListBuffer;
-        linkedListInfo->offset = 0;
-        linkedListInfo->range = linkedListBufferSize;
 
         // geometry pipeline construction
         vsg::DescriptorSetLayoutBindings geomDescriptorBindings{
@@ -489,6 +477,7 @@ int main(int argc, char** argv)
          */
         auto commandGraph{vsg::CommandGraph::create(window)};
 
+        // reset the headImage texture with end-of-list values, 0xffffffff
         VkClearColorValue headImageClearColor;
         headImageClearColor.uint32[0] = 0xffffffff;
 
@@ -505,7 +494,8 @@ int main(int argc, char** argv)
 
         commandGraph->addChild(headImageClearColorCommand);
 
-#if 0
+        // reset the linked list current size, count, to zero by setting just the first 4
+        // bytes, leaving the second half of the buffer, maxNodeCount, untouched
         class FillBuffer : public vsg::Inherit<vsg::Command, FillBuffer>
         {
         public:
@@ -539,14 +529,9 @@ int main(int argc, char** argv)
         protected:
             ~FillBuffer() override = default;
         };
+        commandGraph->addChild(FillBuffer::create(linkedListCurSizeBuffer, 0, sizeof(uint32_t), 0));
 
-        commandGraph->addChild(FillBuffer::create());
-#else
-        linkedListCurSize.count = 0;
-        linkedListCurSizeData->dirty();
-#endif
-
-        // create a memory barrier to ensure all writes are finished before we start to write again
+        // create a memory barrier to ensure all previous writes are finished before we start to write again
         {
             auto memoryBarrier{vsg::MemoryBarrier::create()};
             memoryBarrier->srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
