@@ -137,10 +137,10 @@ void main()
     }
 
     // Do blending
-    vec4 color = vec4(0.025, 0.025, 0.025, 1.0f);
+    vec4 color = vec4(0.95, 0.95, 0.95, 1.0);
     for (int i = 0; i < count; ++i)
     {
-        color = mix(color, fragments[i].color, fragments[i].color.a);
+        color = mix(color, fragments[count-i-1].color, fragments[count-i-1].color.a);
     }
 
     outFragColor = color;
@@ -170,7 +170,7 @@ int main(int argc, char** argv)
             return 1;
         }
 
-        int gpuNumber{1};
+        int gpuNumber{0};
         auto instance = window->getOrCreateInstance();
         (void)window->getOrCreateSurface(); // fulfill contract of getOrCreatePhysicalDevice();
         auto& physicalDevices = instance->getPhysicalDevices();
