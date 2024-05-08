@@ -459,9 +459,10 @@ int main(int argc, char** argv)
         resolveStateGroup->addChild(FabricatedTriangleDraw::create());
 
         /*
-         * Command graph
+         * Command graph construction
          */
-        auto commandGraph{vsg::CommandGraph::create(window)};
+        auto view{vsg::View::create(camera)};
+        auto tpvViewGroup{vsg::Group::create()};
 
         // reset the headImage texture with end-of-list values, 0xffffffff
         VkClearColorValue headImageClearColor;
@@ -478,7 +479,7 @@ int main(int argc, char** argv)
         headImageClearColorCommand->color = headImageClearColor;
         headImageClearColorCommand->ranges.push_back(subresRange);
 
-        commandGraph->addChild(headImageClearColorCommand);
+        view->addChild(headImageClearColorCommand);
 
         // reset the linked list current size, count, to zero for the next frame
         class FillBuffer : public vsg::Inherit<vsg::Command, FillBuffer>
@@ -514,7 +515,7 @@ int main(int argc, char** argv)
         protected:
             ~FillBuffer() override = default;
         };
-        commandGraph->addChild(FillBuffer::create(linkedListCurSizeBuffer, 0, sizeof(uint32_t), 0));
+        view->addChild(FillBuffer::create(linkedListCurSizeBuffer, 0, sizeof(uint32_t), 0));
 
         // create a memory barrier to ensure all previous writes are finished before we start to write again
         {
@@ -523,21 +524,18 @@ int main(int argc, char** argv)
             memoryBarrier->dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
             auto memoryBarrierCommand{vsg::PipelineBarrier::create(
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, memoryBarrier)};
-            commandGraph->addChild(memoryBarrierCommand);
+            view->addChild(memoryBarrierCommand);
         }
-
-        auto view{vsg::View::create(camera)};
-        view->addChild(geomStateGroup);
 
         auto geomRenderGraph{vsg::RenderGraph::create()};
         geomRenderGraph->renderArea.offset = {0, 0};
         geomRenderGraph->renderArea.extent = window->extent2D();
         geomRenderGraph->framebuffer = geomFramebuffer;
-        geomRenderGraph->addChild(view);
-        commandGraph->addChild(geomRenderGraph);
+        geomRenderGraph->addChild(geomStateGroup);
+        view->addChild(geomRenderGraph);
 
         // ensure geometry pass is complete before starting the resolve pass
-        commandGraph->addChild(vsg::PipelineBarrier::create(
+        view->addChild(vsg::PipelineBarrier::create(
             VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0));
 
         // create a memory barrier to ensure all writes are finished before we start to write again
@@ -547,13 +545,15 @@ int main(int argc, char** argv)
             memoryBarrier->dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
             auto memoryBarrierCommand{vsg::PipelineBarrier::create(
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, memoryBarrier)};
-            commandGraph->addChild(memoryBarrierCommand);
+            view->addChild(memoryBarrierCommand);
         }
 
         auto resolveRenderGraph{vsg::createRenderGraphForView(window, camera, resolveStateGroup)};
         resolveRenderGraph->setClearValues({{0.025f, 0.025f, 0.025f, 1.0f}}, {1.0f, 0});
-        commandGraph->addChild(resolveRenderGraph);
+        view->addChild(resolveRenderGraph);
 
+        auto commandGraph{vsg::CommandGraph::create(window)};
+        commandGraph->addChild(view);
         viewer->assignRecordAndSubmitTaskAndPresentation({commandGraph});
         viewer->compile();
 
