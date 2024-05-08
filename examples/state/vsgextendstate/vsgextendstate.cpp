@@ -44,7 +44,6 @@ std::string geomFragShaderSource{R"(
     layout (set = 0, binding = 1) buffer GeometrySBO
     {
         uint count;
-        uint maxNodeCount;
     };
 
     layout (set = 0, binding = 2, r32ui) uniform coherent uimage2D headIndexImage;
@@ -53,6 +52,12 @@ std::string geomFragShaderSource{R"(
     {
         Node nodes[];
     };
+
+    layout (set = 0, binding = 4) uniform MaxNodeCount
+    {
+        uint maxNodeCount;
+    };
+
 #else
     layout(location = 0) out vec4 outFragColor;
 #endif
@@ -212,48 +217,22 @@ int main(int argc, char** argv)
         auto geomFramebuffer{vsg::Framebuffer::create(geomRenderPass, vsg::ImageViews{},
             window->extent2D().width, window->extent2D().height, 1/*layers*/)};
 
-        // define a data structure for maintaining the linked list current and max node count
-        struct LinkedListCurSize
-        {
-            uint32_t count;
-            uint32_t maxNodeCount;
-        };
-#if 0
-        auto stagingBuffer = vsg::createBufferAndMemory(
-            window->getOrCreateDevice(),
-            sizeof(LinkedListCurSize),
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VK_SHARING_MODE_EXCLUSIVE,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        auto stagingBufferMemory{stagingBuffer->getDeviceMemory(window->getOrCreateDevice())};
-        VkResult map(VkDeviceSize offset, VkDeviceSize size, VkMemoryMapFlags flags, void** ppData);
-        void* stagingBufferMappedMemory{};
-        auto vkResult{stagingBufferMemory->map(0, sizeof(LinkedListCurSize), 0, &stagingBufferMappedMemory)};
-        assert(vkResult == VK_SUCCESS);
-#endif
-
+        // create a SSBO buffer for maintaining the linked list current node count
         auto linkedListCurSizeBuffer = vsg::createBufferAndMemory(
             window->getOrCreateDevice(),
-            sizeof(LinkedListCurSize),
+            sizeof(uint32_t),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VK_SHARING_MODE_EXCLUSIVE,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         auto linkedListCurSizeInfo{vsg::BufferInfo::create()};
         linkedListCurSizeInfo->buffer = linkedListCurSizeBuffer;
         linkedListCurSizeInfo->offset = 0;
-        linkedListCurSizeInfo->range = sizeof(LinkedListCurSize);
+        linkedListCurSizeInfo->range = sizeof(uint32_t);
 
-        // Set up GeometrySBO data.
+        // create a uniform variable for specifying the maximum number of fragments in the link list
         constexpr uint32_t MAX_FRAGMENT_NODE_COUNT{5};
-        LinkedListCurSize linkedListCurSize{
-            0,
-            MAX_FRAGMENT_NODE_COUNT * window->extent2D().width * window->extent2D().height};
-#if 0
-        memcpy(stagingBufferMappedMemory, &linkedListCurSize, sizeof(LinkedListCurSize));
-
-        // TODO: need to data from stagingBuffer to linkedListCurSizeBuffer
-        stagingBuffer.reset(); // after copy we no longer need the staging buffer
-#endif
+        auto maxNodeCount{vsg::uintValue::create(
+            MAX_FRAGMENT_NODE_COUNT * window->extent2D().width * window->extent2D().height)};
 
         // create a texture for the headIndex to track the head index of each fragment
         auto headIndexImage{vsg::Image::create()};
@@ -289,7 +268,7 @@ int main(int argc, char** argv)
 
         // create a buffer for the fragment linked list
         auto linkedListBufferSize{static_cast<VkDeviceSize>(
-            sizeof(FragmentNode) * linkedListCurSize.maxNodeCount)};
+            sizeof(FragmentNode) * *maxNodeCount)};
         auto linkedListBuffer{vsg::createBufferAndMemory(
             window->getOrCreateDevice(), linkedListBufferSize,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -328,7 +307,8 @@ int main(int argc, char** argv)
         vsg::DescriptorSetLayoutBindings geomDescriptorBindings{
             {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
             {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-            {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}
+            {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}
         };
         auto geomLinkedListCurSizeInfoDesc{vsg::DescriptorBuffer::create(vsg::BufferInfoList{linkedListCurSizeInfo},
             1, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
@@ -336,10 +316,12 @@ int main(int argc, char** argv)
             2, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)};
         auto geomLinkedListDesc{vsg::DescriptorBuffer::create(vsg::BufferInfoList{linkedListInfo},
             3, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
+        auto geomLinkedListMaxSizeDesc{vsg::DescriptorBuffer::create(maxNodeCount,
+            4, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)};
 
         auto geomDescriptorSetLayout{vsg::DescriptorSetLayout::create(geomDescriptorBindings)};
         auto geomDescriptorSet{vsg::DescriptorSet::create(geomDescriptorSetLayout,
-            vsg::Descriptors{geomLinkedListCurSizeInfoDesc,geomHeadIndexImageDesc,geomLinkedListDesc})};
+            vsg::Descriptors{geomLinkedListCurSizeInfoDesc,geomHeadIndexImageDesc,geomLinkedListDesc,geomLinkedListMaxSizeDesc})};
 
         vsg::VertexInputState::Bindings geomVertexBindingsDescriptions{
             VkVertexInputBindingDescription{0, sizeof(vsg::vec3), VK_VERTEX_INPUT_RATE_VERTEX}, // vertex data
@@ -498,8 +480,7 @@ int main(int argc, char** argv)
 
         commandGraph->addChild(headImageClearColorCommand);
 
-        // reset the linked list current size, count, to zero by setting just the first 4
-        // bytes, leaving the second half of the buffer, maxNodeCount, untouched
+        // reset the linked list current size, count, to zero for the next frame
         class FillBuffer : public vsg::Inherit<vsg::Command, FillBuffer>
         {
         public:
@@ -533,12 +514,7 @@ int main(int argc, char** argv)
         protected:
             ~FillBuffer() override = default;
         };
-#if 0
         commandGraph->addChild(FillBuffer::create(linkedListCurSizeBuffer, 0, sizeof(uint32_t), 0));
-#else
-        commandGraph->addChild(FillBuffer::create(linkedListCurSizeBuffer, 0, sizeof(uint32_t), 0));
-        commandGraph->addChild(FillBuffer::create(linkedListCurSizeBuffer, sizeof(uint32_t), sizeof(uint32_t), linkedListCurSize.maxNodeCount));
-#endif
 
         // create a memory barrier to ensure all previous writes are finished before we start to write again
         {
