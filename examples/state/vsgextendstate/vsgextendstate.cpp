@@ -16,53 +16,89 @@ void main() { gl_Position = (projection * modelView) * vec4(vertex, 1.0); }
 
 std::string resolveVertShaderSource{R"(
 #version 450
+
+/*
+ * Copyright (c) 2023, Google
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 the "License";
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *	 http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #extension GL_ARB_separate_shader_objects : enable
 
 void main()
 {
-    vec2 uv = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
-    gl_Position = vec4(uv * 2.0f + -1.0f, 0.0f, 1.0f);
+	const vec2 fullscreen_triangle[] =
+	{
+		vec2(-1.0f,  3.0f),
+		vec2(-1.0f, -1.0f),
+		vec2( 3.0f, -1.0f),
+	};
+	const vec2 vertex = fullscreen_triangle[gl_VertexIndex % 3];
+	gl_Position = vec4(vertex, 0.0f, 1.0f);
 }
 )"};
 
 std::string geomFragShaderSource{R"(
 #version 450
+
+/*
+ * Copyright (c) 2023, Google
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 the "License";
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *	 http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #extension GL_ARB_separate_shader_objects : enable
 #pragma import_defines ( OIT )
 
 #define OIT 1
 #if defined(OIT)
-    layout (early_fragment_tests) in;
-
-    struct Node
+    layout(set = 0, binding = 0) uniform OITConstants
     {
-        vec4 color;
-        float depth;
-        uint next;
-    };
+        uint  fragmentMaxCount;
+        uint  sortedFragmentCount;
+    } oitConstants;
 
-    layout (set = 0, binding = 1) buffer GeometrySBO
+    layout(set = 0, binding = 1, r32ui) uniform uimage2D linkedListHeadTex;
+
+    layout(set = 0, binding = 2) buffer FragmentBuffer
     {
-        uint count;
-    };
+        uvec3 data[];
+    } fragmentBuffer;
 
-    layout (set = 0, binding = 2, r32ui) uniform coherent uimage2D headIndexImage;
-
-    layout (set = 0, binding = 3) buffer LinkedListSBO
+    layout(set = 0, binding = 3) buffer FragmentCounter
     {
-        Node nodes[];
-    };
-
-    layout (set = 0, binding = 4) uniform MaxNodeCount
-    {
-        uint maxNodeCount;
-    };
-
+        uint value;
+    } fragmentCounter;
 #else
     layout(location = 0) out vec4 outFragColor;
 #endif
 
-void main() {
+void main()
+{
     float a = gl_PrimitiveID*0.1;
     float b = 1.0-gl_PrimitiveID*0.1;
     vec4 color;
@@ -72,20 +108,20 @@ void main() {
         color = vec4(b, a, 0, 0.5);
 
     #if defined(OIT)
-        // Increase the node count
-        uint nodeIdx = atomicAdd(count, 1);
+        // Get the next fragment index
+        const uint nextFragmentIndex = atomicAdd(fragmentCounter.value, 1U);
 
-        // Check LinkedListSBO is full
-        if (nodeIdx < maxNodeCount)
+        // Ignore the fragment if the fragment buffer is full
+        if(nextFragmentIndex >= oitConstants.fragmentMaxCount)
         {
-            // Exchange new head index and previous head index
-            uint prevHeadIdx = imageAtomicExchange(headIndexImage, ivec2(gl_FragCoord.xy), nodeIdx);
-
-            // Store node data
-            nodes[nodeIdx].color = color;
-            nodes[nodeIdx].depth = gl_FragCoord.z;
-            nodes[nodeIdx].next = prevHeadIdx;
+            discard;
         }
+
+        // Update the linked list head
+        const uint previousFragmentIndex = imageAtomicExchange(linkedListHeadTex, ivec2(gl_FragCoord.xy), nextFragmentIndex);
+
+        // Add the fragment to the buffer
+        fragmentBuffer.data[nextFragmentIndex] = uvec3(previousFragmentIndex, packUnorm4x8(color), floatBitsToUint(gl_FragCoord.z));
     #else
         outFragColor = color;
     #endif
@@ -94,61 +130,158 @@ void main() {
 
 std::string resolveFragShaderSource{R"(
 #version 450
+
+/*
+ * Copyright (c) 2023, Google
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 the "License";
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *	 http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #extension GL_ARB_separate_shader_objects : enable
 
-#define MAX_FRAGMENT_COUNT 128
+#define LINKED_LIST_END_SENTINEL	0xFFFFFFFFU
 
-struct Node
+// For performance reasons, this should be kept as low as result correctness allows.
+#define SORTED_FRAGMENT_MAX_COUNT	16U
+
+layout(set = 0, binding = 0) uniform OITConstants
 {
-    vec4 color;
-    float depth;
-    uint next;
-};
+	uint  fragmentMaxCount;
+	uint  sortedFragmentCount;
+} oitConstants;
+
+layout(set = 0, binding = 1, r32ui) uniform uimage2D linkedListHeadTex;
+
+layout(set = 0, binding = 2) buffer FragmentBuffer
+{
+	uvec3 data[];
+} fragmentBuffer;
+
+layout(set = 0, binding = 3) buffer FragmentCounter
+{
+	uint value;
+} fragmentCounter;
 
 layout (location = 0) out vec4 outFragColor;
 
-layout (set = 0, binding = 0, r32ui) uniform uimage2D headIndexImage;
-
-layout (set = 0, binding = 1) buffer LinkedListSBO
+// Blend two colors.
+// The alpha channel keeps track of the amount of visibility of the background.
+vec4 blendColors(uint packedSrcColor, vec4 dstColor)
 {
-    Node nodes[];
-};
+	const vec4 srcColor = unpackUnorm4x8(packedSrcColor);
+	return vec4(
+		mix(dstColor.rgb, srcColor.rgb, srcColor.a),
+		dstColor.a * (1.0f - srcColor.a));
+}
+
+// Sort and blend fragments from the linked list.
+// For performance reasons, the maximum number of sorted fragments is limited.
+// Approximations are used when the number of fragments is over the limit.
+vec4 mergeSort(uint firstFragmentIndex)
+{
+	// Fragments are sorted from back to front.
+	// e.g. sortedFragments[0] is the farthest from the camera.
+	uvec2 sortedFragments[SORTED_FRAGMENT_MAX_COUNT];
+	uint sortedFragmentCount = 0U;
+	const uint kSortedFragmentMaxCount = min(oitConstants.sortedFragmentCount, SORTED_FRAGMENT_MAX_COUNT);
+
+	vec4 color = vec4(0.0f, 0.0f, 0.0f, 1.0f);
+    bool initialColorSet = false;
+	uint fragmentIndex = firstFragmentIndex;
+	while(fragmentIndex != LINKED_LIST_END_SENTINEL)
+	{
+		const uvec3 fragment = fragmentBuffer.data[fragmentIndex];
+		fragmentIndex = fragment.x;
+
+		if(sortedFragmentCount < kSortedFragmentMaxCount)
+		{
+			// There is still room in the sorted list.
+			// Insert the fragment so that the list stay sorted.
+			uint i = sortedFragmentCount;
+			for(; (i > 0) && (fragment.z < sortedFragments[i - 1].y); --i)
+			{
+				sortedFragments[i] = sortedFragments[i - 1];
+			}
+			sortedFragments[i] = fragment.yz;
+			++sortedFragmentCount;
+		}
+		else if(sortedFragments[0].y < fragment.z)
+		{
+			// The fragment is closer than the farthest sorted one.
+			// First, make room by blending the farthest fragment from the sorted list.
+			// Then, insert the fragment in the sorted list.
+            // This is an approximation.
+            if (initialColorSet) {
+                color = blendColors(sortedFragments[0].x, color);
+            } else {
+                color = unpackUnorm4x8(sortedFragments[0].x);
+                initialColorSet = true;
+            }
+			uint i = 0;
+			for(; (i < kSortedFragmentMaxCount - 1) && (sortedFragments[i + 1].y < fragment.z); ++i)
+			{
+				sortedFragments[i] = sortedFragments[i + 1];
+			}
+			sortedFragments[i] = fragment.yz;
+		}
+		else
+		{
+			// The next fragment is farther than any of the sorted ones.
+			// Blend it early.
+            // This is an approximation.
+            if (initialColorSet) {
+                color = blendColors(fragment.y, color);
+            } else {
+                color = unpackUnorm4x8(fragment.y);
+                initialColorSet = true;
+            }
+		}
+	}
+
+	// Early return if there are no fragments.
+	if(sortedFragmentCount == 0)
+	{
+		return vec4(0.0f);
+	}
+
+	// Blend the sorted fragments to get the final color.
+	for(int i = 0; i < sortedFragmentCount; ++i)
+	{
+        if (i == 0 && !initialColorSet) {
+            color = unpackUnorm4x8(sortedFragments[i].x);
+        } else {
+    		color = blendColors(sortedFragments[i].x, color);
+        }
+	}
+	color.a = 1.0f - color.a;
+	return color;
+}
 
 void main()
 {
-    Node fragments[MAX_FRAGMENT_COUNT];
-    int count = 0;
+	// Reset the atomic counter for the next frame.
+	// Note that we don't care about atomicity here, as all threads will write the same value.
+	fragmentCounter.value = 0;
 
-    uint nodeIdx = imageLoad(headIndexImage, ivec2(gl_FragCoord.xy)).r;
+	// Get the first fragment index in the linked list.
+	uint fragmentIndex = imageLoad(linkedListHeadTex, ivec2(gl_FragCoord.xy)).r;
+	// Reset the list head for the next frame.
+	imageStore(linkedListHeadTex, ivec2(gl_FragCoord.xy), uvec4(LINKED_LIST_END_SENTINEL, 0, 0, 0));
 
-    while (nodeIdx != 0xffffffff && count < MAX_FRAGMENT_COUNT)
-    {
-        fragments[count] = nodes[nodeIdx];
-        nodeIdx = fragments[count].next;
-        ++count;
-    }
-
-    // Do the insertion sort
-    for (uint i = 1; i < count; ++i)
-    {
-        Node insert = fragments[i];
-        uint j = i;
-        while (j > 0 && insert.depth > fragments[j - 1].depth)
-        {
-            fragments[j] = fragments[j-1];
-            --j;
-        }
-        fragments[j] = insert;
-    }
-
-    // Do blending
-    vec4 color = vec4(0.95, 0.95, 0.95, 1.0);
-    for (int i = 0; i < count; ++i)
-    {
-        color = mix(color, fragments[count-i-1].color, fragments[count-i-1].color.a);
-    }
-
-    outFragColor = color;
+	// Compute the final color.
+	outFragColor = mergeSort(fragmentIndex);
 }
 )"};
 
@@ -229,10 +362,19 @@ int main(int argc, char** argv)
         linkedListCurSizeInfo->offset = 0;
         linkedListCurSizeInfo->range = sizeof(uint32_t);
 
-        // create a uniform variable for specifying the maximum number of fragments in the link list
-        constexpr uint32_t MAX_FRAGMENT_NODE_COUNT{5};
-        auto maxNodeCount{vsg::uintValue::create(
-            MAX_FRAGMENT_NODE_COUNT * window->extent2D().width * window->extent2D().height)};
+        // create a uniform buffer for specifying the oit algorithm constants
+        constexpr uint32_t kSortedFragmentMaxCount = 16;
+        constexpr uint32_t kFragmentsPerPixelAverage = kSortedFragmentMaxCount/2;
+        struct OITConstants
+        {
+            uint32_t fragmentMaxCount;
+            uint32_t sortedFragmentCount;
+        };
+        using OITConstantsValue = vsg::Value<OITConstants>;
+        auto oitConstants{OITConstantsValue::create()};
+        oitConstants->value().fragmentMaxCount =
+            window->extent2D().width * window->extent2D().height * kFragmentsPerPixelAverage;
+        oitConstants->value().sortedFragmentCount = kSortedFragmentMaxCount;
 
         // create a texture for the headIndex to track the head index of each fragment
         auto headIndexImage{vsg::Image::create()};
@@ -257,18 +399,9 @@ int main(int argc, char** argv)
             window->getOrCreateDevice(), headIndexImage, VK_IMAGE_ASPECT_COLOR_BIT);
         headIndexImageInfo->imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-
-        // define a fragment node data structure to collect in the geometry pass and sort in the resolve pass
-        struct FragmentNode
-        {
-            vsg::vec4 color;
-            float     depth;
-            uint32_t  next;
-        };
-
         // create a buffer for the fragment linked list
         auto linkedListBufferSize{static_cast<VkDeviceSize>(
-            sizeof(FragmentNode) * *maxNodeCount)};
+            sizeof(vsg::uivec3) * oitConstants->value().fragmentMaxCount)};
         auto linkedListBuffer{vsg::createBufferAndMemory(
             window->getOrCreateDevice(), linkedListBufferSize,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -279,49 +412,106 @@ int main(int argc, char** argv)
         linkedListInfo->offset = 0;
         linkedListInfo->range = linkedListBufferSize;
 
+        // initialize shader buffer resources
+        {
+            // create a command to clear the linked list current size to zero
+            class FillBuffer : public vsg::Inherit<vsg::Command, FillBuffer>
+            {
+            public:
+                vsg::ref_ptr<vsg::Buffer> buffer;
+                VkDeviceSize dstOffset;
+                VkDeviceSize dataSize;
+                uint32_t data;
 
-        // create a barrier to change headIndexImage's layout from UNDEFINED to GENERAL
-        auto headIndexImageBarrier{vsg::ImageMemoryBarrier::create()};
-        headIndexImageBarrier->srcAccessMask = 0;
-        headIndexImageBarrier->dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        headIndexImageBarrier->oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        headIndexImageBarrier->newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        headIndexImageBarrier->image = headIndexImage;
-        headIndexImageBarrier->subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        headIndexImageBarrier->subresourceRange.baseArrayLayer = 0;
-        headIndexImageBarrier->subresourceRange.layerCount = 1;
-        headIndexImageBarrier->subresourceRange.levelCount = 1;
+                FillBuffer(vsg::ref_ptr<vsg::Buffer> in_buffer,
+                           VkDeviceSize in_dstOffset,
+                           VkDeviceSize in_dataSize,
+                           uint32_t in_data)
+                    : Inherit{}
+                    , buffer{in_buffer}
+                    , dstOffset{in_dstOffset}
+                    , dataSize{in_dataSize}
+                    , data{in_data}
+                {
+                }
 
-        // change headIndexImage's layout from UNDEFINED to GENERAL
-        auto headIndexImageBarrierCommand{vsg::PipelineBarrier::create(
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, headIndexImageBarrier)};
-        auto queueFamilyIndex{window->getOrCreatePhysicalDevice()->getQueueFamily(VK_QUEUE_GRAPHICS_BIT)};
-        auto commandPool{vsg::CommandPool::create(window->getOrCreateDevice(), queueFamilyIndex)};
-        auto queue{window->getOrCreateDevice()->getQueue(queueFamilyIndex)};
-        vsg::submitCommandsToQueue(commandPool, nullptr, 0, queue,
-            [&](vsg::CommandBuffer& commandBuffer) {
-                headIndexImageBarrierCommand->record(commandBuffer);
-            });
+                FillBuffer(FillBuffer const& rhs, vsg::CopyOp const& copyop = {})
+                    : Inherit(rhs, copyop)
+                {
+                }
+
+                void record(vsg::CommandBuffer& commandBuffer) const override
+                {
+                    vkCmdFillBuffer(commandBuffer, buffer->vk(commandBuffer.deviceID), dstOffset, dataSize, data);
+                }
+
+            protected:
+                ~FillBuffer() override = default;
+            };
+            auto linkedListCurSizeClearCommand{FillBuffer::create(linkedListCurSizeBuffer, 0, sizeof(uint32_t), 0)};
+
+            // create a pipeline barrier command to change the headIndexImage's layout from UNDEFINED to GENERAL
+            auto headIndexImageBarrier{vsg::ImageMemoryBarrier::create()};
+            headIndexImageBarrier->srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            headIndexImageBarrier->dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            headIndexImageBarrier->oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            headIndexImageBarrier->newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            headIndexImageBarrier->image = headIndexImage;
+            headIndexImageBarrier->subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            headIndexImageBarrier->subresourceRange.baseArrayLayer = 0;
+            headIndexImageBarrier->subresourceRange.layerCount = 1;
+            headIndexImageBarrier->subresourceRange.levelCount = 1;
+
+            auto headIndexImageBarrierCommand{vsg::PipelineBarrier::create(
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, headIndexImageBarrier)};
+
+            // create a clear command to reset the headIndexImage texture with end-of-list values, 0xffffffff
+            VkClearColorValue headImageClearColor;
+            for (auto& uint32 : headImageClearColor.uint32)
+                uint32 = 0xffffffff;
+
+            VkImageSubresourceRange subresRange{};
+            subresRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            subresRange.levelCount = 1;
+            subresRange.layerCount = 1;
+
+            auto headIndexImageClearColorCommand{vsg::ClearColorImage::create()};
+            headIndexImageClearColorCommand->image = headIndexImage;
+            headIndexImageClearColorCommand->imageLayout = headIndexImageInfo->imageLayout;
+            headIndexImageClearColorCommand->color = headImageClearColor;
+            headIndexImageClearColorCommand->ranges.push_back(subresRange);
+
+            // execute the command to perform the image layout transition and initialization
+            auto queueFamilyIndex{window->getOrCreatePhysicalDevice()->getQueueFamily(VK_QUEUE_GRAPHICS_BIT)};
+            auto commandPool{vsg::CommandPool::create(window->getOrCreateDevice(), queueFamilyIndex)};
+            auto queue{window->getOrCreateDevice()->getQueue(queueFamilyIndex)};
+            vsg::submitCommandsToQueue(commandPool, nullptr, 0, queue,
+                [&](vsg::CommandBuffer& commandBuffer){
+                    linkedListCurSizeClearCommand->record(commandBuffer);
+                    headIndexImageBarrierCommand->record(commandBuffer);
+                    headIndexImageClearColorCommand->record(commandBuffer);
+                });
+        }
 
         // geometry pipeline construction
         vsg::DescriptorSetLayoutBindings geomDescriptorBindings{
-            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-            {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-            {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-            {4, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}
+            {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}
         };
-        auto geomLinkedListCurSizeInfoDesc{vsg::DescriptorBuffer::create(vsg::BufferInfoList{linkedListCurSizeInfo},
-            1, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
+        auto geomOITConstantsDesc{vsg::DescriptorBuffer::create(oitConstants,
+            0, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)};
         auto geomHeadIndexImageDesc{vsg::DescriptorImage::create(headIndexImageInfo,
-            2, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)};
+            1, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)};
         auto geomLinkedListDesc{vsg::DescriptorBuffer::create(vsg::BufferInfoList{linkedListInfo},
+            2, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
+        auto geomLinkedListCurSizeInfoDesc{vsg::DescriptorBuffer::create(vsg::BufferInfoList{linkedListCurSizeInfo},
             3, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
-        auto geomLinkedListMaxSizeDesc{vsg::DescriptorBuffer::create(maxNodeCount,
-            4, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)};
 
         auto geomDescriptorSetLayout{vsg::DescriptorSetLayout::create(geomDescriptorBindings)};
         auto geomDescriptorSet{vsg::DescriptorSet::create(geomDescriptorSetLayout,
-            vsg::Descriptors{geomLinkedListCurSizeInfoDesc,geomHeadIndexImageDesc,geomLinkedListDesc,geomLinkedListMaxSizeDesc})};
+            vsg::Descriptors{geomOITConstantsDesc,geomHeadIndexImageDesc,geomLinkedListDesc,geomLinkedListCurSizeInfoDesc})};
 
         vsg::VertexInputState::Bindings geomVertexBindingsDescriptions{
             VkVertexInputBindingDescription{0, sizeof(vsg::vec3), VK_VERTEX_INPUT_RATE_VERTEX}, // vertex data
@@ -337,7 +527,7 @@ int main(int argc, char** argv)
         auto depthStencilState{vsg::DepthStencilState::create()};
         depthStencilState->depthTestEnable = VK_FALSE;
         depthStencilState->depthWriteEnable = VK_FALSE;
-        depthStencilState->depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+        depthStencilState->back.compareOp = VK_COMPARE_OP_ALWAYS;
         vsg::GraphicsPipelineStates geomPipelineStates{
             vsg::VertexInputState::create(geomVertexBindingsDescriptions, geomVertexAttributeDescriptions),
             inputAssemblyState,
@@ -365,24 +555,40 @@ int main(int argc, char** argv)
 
         // resolve pipeline construction
         vsg::DescriptorSetLayoutBindings resolveDescriptorBindings{
-            {0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-            {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}
+            {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,  1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+            {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}
         };
+        auto resolveOITConstantsDesc{vsg::DescriptorBuffer::create(oitConstants,
+            0, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)};
         auto resolveHeadIndexImageDesc{vsg::DescriptorImage::create(headIndexImageInfo,
-            0, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)};
+            1, 0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)};
         auto resolveLinkedListDesc{vsg::DescriptorBuffer::create(vsg::BufferInfoList{linkedListInfo},
-            1, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
+            2, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
+        auto resolveLinkedListCurSizeInfoDesc{vsg::DescriptorBuffer::create(vsg::BufferInfoList{linkedListCurSizeInfo},
+            3, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)};
 
         auto resolveDescriptorSetLayout{vsg::DescriptorSetLayout::create(resolveDescriptorBindings)};
         auto resolveDescriptorSet{vsg::DescriptorSet::create(resolveDescriptorSetLayout,
-            vsg::Descriptors{resolveHeadIndexImageDesc,resolveLinkedListDesc})};
+            vsg::Descriptors{resolveOITConstantsDesc,resolveHeadIndexImageDesc,resolveLinkedListDesc,resolveLinkedListCurSizeInfoDesc})};
+
+        VkPipelineColorBlendAttachmentState resolveColorBlendState{};
+        resolveColorBlendState.blendEnable         = VK_TRUE;
+        resolveColorBlendState.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        resolveColorBlendState.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        resolveColorBlendState.colorBlendOp        = VK_BLEND_OP_ADD;
+        resolveColorBlendState.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        resolveColorBlendState.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        resolveColorBlendState.alphaBlendOp        = VK_BLEND_OP_ADD;
+        resolveColorBlendState.colorWriteMask      = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
         vsg::GraphicsPipelineStates resolvePipelineStates{
             vsg::VertexInputState::create(),
             inputAssemblyState,
             rasterizationState,
             vsg::MultisampleState::create(),
-            vsg::ColorBlendState::create(),
+            vsg::ColorBlendState::create(vsg::ColorBlendState::ColorBlendAttachments{{resolveColorBlendState}}),
             depthStencilState
         };
         auto resolvePipelineLayout{vsg::PipelineLayout::create(
@@ -458,74 +664,12 @@ int main(int argc, char** argv)
 
         resolveStateGroup->addChild(FabricatedTriangleDraw::create());
 
+        // Create the view to receive the command graph construction
+        auto view{vsg::View::create(camera)};
+
         /*
          * Command graph construction
          */
-        auto view{vsg::View::create(camera)};
-        auto tpvViewGroup{vsg::Group::create()};
-
-        // reset the headImage texture with end-of-list values, 0xffffffff
-        VkClearColorValue headImageClearColor;
-        headImageClearColor.uint32[0] = 0xffffffff;
-
-        VkImageSubresourceRange subresRange{};
-        subresRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        subresRange.levelCount = 1;
-        subresRange.layerCount = 1;
-
-        auto headImageClearColorCommand{vsg::ClearColorImage::create()};
-        headImageClearColorCommand->image = headIndexImage;
-        headImageClearColorCommand->imageLayout = headIndexImageInfo->imageLayout;
-        headImageClearColorCommand->color = headImageClearColor;
-        headImageClearColorCommand->ranges.push_back(subresRange);
-
-        view->addChild(headImageClearColorCommand);
-
-        // reset the linked list current size, count, to zero for the next frame
-        class FillBuffer : public vsg::Inherit<vsg::Command, FillBuffer>
-        {
-        public:
-            vsg::ref_ptr<vsg::Buffer> buffer;
-            VkDeviceSize dstOffset;
-            VkDeviceSize dataSize;
-            uint32_t data;
-
-            FillBuffer(vsg::ref_ptr<vsg::Buffer> in_buffer,
-                       VkDeviceSize in_dstOffset,
-                       VkDeviceSize in_dataSize,
-                       uint32_t in_data)
-                : Inherit{}
-                , buffer{in_buffer}
-                , dstOffset{in_dstOffset}
-                , dataSize{in_dataSize}
-                , data{in_data}
-            {
-            }
-
-            FillBuffer(FillBuffer const& rhs, vsg::CopyOp const& copyop = {})
-                : Inherit(rhs, copyop)
-            {
-            }
-
-            void record(vsg::CommandBuffer& commandBuffer) const override
-            {
-                vkCmdFillBuffer(commandBuffer, buffer->vk(commandBuffer.deviceID), dstOffset, dataSize, data);
-            }
-
-        protected:
-            ~FillBuffer() override = default;
-        };
-        view->addChild(FillBuffer::create(linkedListCurSizeBuffer, 0, sizeof(uint32_t), 0));
-
-        // create a memory barrier to ensure all previous writes are finished before we start to write again
-        {
-            auto memoryBarrier{vsg::MemoryBarrier::create()};
-            memoryBarrier->srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            memoryBarrier->dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            auto memoryBarrierCommand{vsg::PipelineBarrier::create(
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, memoryBarrier)};
-            view->addChild(memoryBarrierCommand);
-        }
 
         auto geomRenderGraph{vsg::RenderGraph::create()};
         geomRenderGraph->renderArea.offset = {0, 0};
@@ -534,22 +678,25 @@ int main(int argc, char** argv)
         geomRenderGraph->addChild(geomStateGroup);
         view->addChild(geomRenderGraph);
 
-        // ensure geometry pass is complete before starting the resolve pass
-        view->addChild(vsg::PipelineBarrier::create(
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0));
-
-        // create a memory barrier to ensure all writes are finished before we start to write again
+        // create a pipeline barrier command to transition the headIndexImage's to the resolve pass
         {
-            auto memoryBarrier{vsg::MemoryBarrier::create()};
-            memoryBarrier->srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            memoryBarrier->dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            auto memoryBarrierCommand{vsg::PipelineBarrier::create(
-                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, memoryBarrier)};
-            view->addChild(memoryBarrierCommand);
+            auto headIndexImageBarrier{vsg::ImageMemoryBarrier::create()};
+            headIndexImageBarrier->srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            headIndexImageBarrier->dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            headIndexImageBarrier->oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            headIndexImageBarrier->newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            headIndexImageBarrier->image = headIndexImage;
+            headIndexImageBarrier->subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            headIndexImageBarrier->subresourceRange.baseArrayLayer = 0;
+            headIndexImageBarrier->subresourceRange.layerCount = 1;
+            headIndexImageBarrier->subresourceRange.levelCount = 1;
+
+            view->addChild(vsg::PipelineBarrier::create(
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, headIndexImageBarrier));
         }
 
         auto resolveRenderGraph{vsg::createRenderGraphForView(window, camera, resolveStateGroup)};
-        resolveRenderGraph->setClearValues({{0.025f, 0.025f, 0.025f, 1.0f}}, {1.0f, 0});
+        resolveRenderGraph->setClearValues({{0.95f, 0.95f, 0.95f, 1.0f}}, {1.0f, 0});
         view->addChild(resolveRenderGraph);
 
         auto commandGraph{vsg::CommandGraph::create(window)};
